@@ -1,0 +1,152 @@
+# KumoRFM Configuration File
+
+# Model Configuration
+model:
+  hidden_dim: 256
+  num_layers: 4
+  num_heads: 8
+  dropout_rate: 0.3
+  
+  # Sampling parameters
+  sampling:
+    max_neighbors: 300
+    num_hops: 2
+    context_window_size: 10
+    strategy: "mixed"  # temporal, structural, mixed, self
+    time_decay_factor: 0.9
+    
+  # RelGT parameters
+  relgt:
+    num_global_tokens: 4096
+    use_global_attention: true
+    
+  # ICL parameters
+  icl:
+    num_layers: 2
+    num_heads: 8
+
+# Training Configuration
+training:
+  batch_size: 256
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  gradient_clip: 1.0
+  num_epochs: 100
+  early_stopping_patience: 10
+  
+  # Optimizer
+  optimizer:
+    type: "adamw"  # adam, adamw, sgd
+    betas: [0.9, 0.999]
+    eps: 1.0e-08
+    
+  # Learning rate scheduler
+  scheduler:
+    type: "cosine"  # cosine, linear, constant, exponential
+    num_warmup_steps: 1000
+    
+  # Data splitting
+  data_split:
+    train_ratio: 0.7
+    val_ratio: 0.15
+    test_ratio: 0.15
+
+# Encoder Configuration
+encoders:
+  # Numerical columns
+  numerical:
+    embedding_dim: 64
+    use_normalization: true
+    
+  # Categorical columns
+  categorical:
+    embedding_dim: 64
+    max_vocab_size: 10000
+    unknown_token_id: 0
+    
+  # Text columns
+  text:
+    model_name: "sentence-transformers/all-MiniLM-L6-v2"
+    max_length: 512
+    pooling: "mean"  # mean, max, cls
+    
+  # Time columns
+  time:
+    embedding_dim: 64
+    encoding_type: "sinusoidal"  # sinusoidal, learned
+
+# Database Schema Example
+database_schema:
+  users:
+    user_id: "categorical"
+    age: "numerical"
+    gender: "categorical"
+    city: "categorical"
+    registration_date: "time"
+    
+  items:
+    item_id: "categorical"
+    category: "categorical"
+    price: "numerical"
+    brand: "categorical"
+    description: "text"
+    
+  transactions:
+    transaction_id: "categorical"
+    user_id: "categorical"
+    item_id: "categorical"
+    timestamp: "time"
+    amount: "numerical"
+    quantity: "numerical"
+
+# Task Configurations
+tasks:
+  # User purchase prediction
+  user_purchase_prediction:
+    type: "classification"
+    target_column: "will_purchase"
+    num_classes: 2
+    time_window_start: -30
+    time_window_end: 0
+    
+  # Sales forecasting
+  sales_forecasting:
+    type: "regression"
+    target_column: "amount"
+    aggregation: "sum"
+    time_window_start: -7
+    time_window_end: 0
+    
+  # Item recommendation
+  item_recommendation:
+    type: "link_prediction"
+    negative_sampling_ratio: 5
+    link_prediction_mode: "transductive"
+
+# Experiment Configuration
+experiment:
+  seed: 42
+  save_dir: "./checkpoints"
+  log_dir: "./logs"
+  metrics: ["accuracy", "f1", "auc", "mae", "rmse"]
+  
+  # Wandb configuration (optional)
+  wandb:
+    enabled: false
+    project: "kumorfm"
+    entity: null
+    tags: ["baseline"]
+
+# Inference Configuration
+inference:
+  cache_enabled: true
+  batch_size: 32
+  device: "cuda"  # cuda, cpu, auto
+  
+# API Server Configuration
+api:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 4
+  timeout: 300
+  max_request_size: 10485760  # 10MB
