@@ -32,7 +32,7 @@ RGFM采用五阶段处理流程：
 ```bash
 # 克隆仓库
 git clone https://github.com/JeromeZzz/RGFM.git
-cd kumorfm
+cd RGFM
 
 # 安装依赖
 pip install -r requirements.txt
