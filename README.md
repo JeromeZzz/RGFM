@@ -1,10 +1,10 @@
-# KumoRFM: 关系数据基础模型
+# RGFM: 关系数据基础模型
 
 [![Python Version](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/pytorch-2.0%2B-red)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-KumoRFM (Kumo Relational Foundation Model) 是一个基于深度学习的关系数据基础模型，专门设计用于处理时序异构图数据。它结合了最先进的图神经网络技术和上下文学习机制，能够在各种关系数据预测任务上实现优异的性能。
+RGFM 是一个基于深度学习的关系数据基础模型，专门设计用于处理时序异构图数据。它结合了最先进的图神经网络技术和上下文学习机制，能够在各种关系数据预测任务上实现优异的性能。
 
 ## 🌟 主要特性
 
@@ -17,7 +17,7 @@ KumoRFM (Kumo Relational Foundation Model) 是一个基于深度学习的关系�
 
 ## 🏗️ 架构概览
 
-KumoRFM采用五阶段处理流程：
+RGFM采用五阶段处理流程：
 
 1. **动态子图采样**: 从时序异构图中采样相关的历史子图
 2. **多模态特征编码**: 统一编码不同类型的数据
@@ -31,7 +31,7 @@ KumoRFM采用五阶段处理流程：
 
 ```bash
 # 克隆仓库
-git clone https://github.com/yourusername/kumorfm.git
+git clone https://github.com/JeromeZzz/RGFM.git
 cd kumorfm
 
 # 安装依赖
@@ -244,32 +244,3 @@ kumorfm/
 
 - **实体内上下文**: 关注目标实体自身的历史
 - **子图间上下文**: 捕获不同历史快照间的模式
-
-## 🤝 贡献指南
-
-我们欢迎各种形式的贡献！请参考以下步骤：
-
-1. Fork 仓库
-2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 开启 Pull Request
-
-## 📄 许可证
-
-本项目采用 MIT 许可证 - 详见 [LICENSE](LICENSE) 文件
-
-## 🙏 致谢
-
-- 感谢 [RelGT](https://github.com/snap-stanford/relgt) 项目提供的关系图变换器实现
-- 基于 KumoRFM 论文的技术流程和架构设计
-
-## 📮 联系方式
-
-- 项目主页: [https://github.com/yourusername/kumorfm](https://github.com/yourusername/kumorfm)
-- 问题反馈: [Issues](https://github.com/yourusername/kumorfm/issues)
-- 邮件: kumorfm@example.com
-
----
-
-⭐ 如果这个项目对您有帮助，请给我们一个星标！
