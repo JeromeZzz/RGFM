@@ -23,7 +23,7 @@ from .icl.dual_context import DualContextMechanism
 class KumoRFM(nn.Module):
     """
     KumoRFM (Kumo Relational Foundation Model)
-    关系数据基础模型
+    Relational Data Foundation Model
     """
 
     def __init__(self,
@@ -31,14 +31,14 @@ class KumoRFM(nn.Module):
                  database_schema: Dict[str, Dict[str, str]]):
         """
         Args:
-            config: 模型配置
-            database_schema: 数据库模式 {table_name: {column_name: column_type}}
+            config: Model configuration
+            database_schema: Database schema {table_name: {column_name: column_type}}
         """
         super().__init__()
         self.config = config
         self.database_schema = database_schema
 
-        # 初始化采样器
+        # Initialize samplers
         sampling_config = config.__dict__.get('sampling_config', None)
         if sampling_config is None:
             from config.model_config import SamplingConfig
@@ -47,31 +47,31 @@ class KumoRFM(nn.Module):
         self.backward_sampler = BackwardSubgraphSampler(sampling_config)
         self.context_sampler = ContextSampler(sampling_config, self.backward_sampler)
 
-        # 初始化编码器
+        # Initialize encoders
         self._init_encoders()
 
-        # 初始化RelGT
+        # Initialize RelGT
         num_node_types = len(database_schema)
         self.relgt = RelGTWrapper(config, num_node_types)
 
-        # 初始化ICL模块
+        # Initialize ICL module
         self.icl_module = ICLModule(config)
         self.dual_context = DualContextMechanism(config)
 
-        # 注册任务头
+        # Register task heads
         self._register_task_heads()
 
-        # 缓存
+        # Cache
         self.encoding_cache = {}
 
     def _init_encoders(self):
-        """初始化各种编码器"""
-        # 多模态编码器
+        """Initialize various encoders"""
+        # Multimodal encoder
         from config.model_config import ColumnEncoderConfig
         column_config = ColumnEncoderConfig()
         self.multimodal_encoder = MultiModalEncoder(column_config, self.config.hidden_dim)
 
-        # 注册所有列
+        # Register all columns
         for table_name, columns in self.database_schema.items():
             for column_name, column_type in columns.items():
                 self.multimodal_encoder.register_column(
@@ -79,29 +79,29 @@ class KumoRFM(nn.Module):
                     column_type
                 )
 
-        # 表编码器
+        # Table encoder
         table_names = list(self.database_schema.keys())
         self.table_encoder = MultiTableEncoder(self.config, table_names)
 
-        # Token化器
+        # Tokenizer
         num_node_types = len(self.database_schema)
         self.tokenizer = MultiElementTokenizer(self.config, num_node_types)
 
     def _register_task_heads(self):
-        """注册任务特定的预测头"""
-        # 分类任务头（默认二分类）
+        """Register task-specific prediction heads"""
+        # Classification task head (default binary classification)
         self.icl_module.register_task_head(
             'classification',
             ClassificationHead(self.config, num_classes=2)
         )
 
-        # 回归任务头
+        # Regression task head
         self.icl_module.register_task_head(
             'regression',
             RegressionHead(self.config)
         )
 
-        # 链接预测任务头
+        # Link prediction task head
         self.icl_module.register_task_head(
             'link_prediction',
             LinkPredictionHead(self.config)
@@ -115,20 +115,20 @@ class KumoRFM(nn.Module):
                 context_strategy: str = 'mixed',
                 num_context: int = 10) -> Dict[str, Any]:
         """
-        前向传播
+        Forward propagation
 
         Args:
-            graph: 时序异构图
-            target_entity: 目标实体 (节点类型, 节点ID)
-            prediction_time: 预测时间
-            task_config: 任务配置
-            context_strategy: 上下文采样策略
-            num_context: 上下文示例数量
+            graph: Temporal heterogeneous graph
+            target_entity: Target entity (node_type, node_id)
+            prediction_time: Prediction time
+            task_config: Task configuration
+            context_strategy: Context sampling strategy
+            num_context: Number of context examples
 
         Returns:
-            预测结果字典
+            Prediction results dictionary
         """
-        # 1. 动态子图采样
+        # 1. Dynamic subgraph sampling
         test_subgraph = self.backward_sampler.sample(
             graph,
             target_entity,
@@ -137,7 +137,7 @@ class KumoRFM(nn.Module):
             max_nodes=self.config.max_neighbors
         )
 
-        # 2. 上下文采样
+        # 2. Context sampling
         context_examples = self.context_sampler.sample_context(
             graph,
             target_entity,
@@ -147,10 +147,10 @@ class KumoRFM(nn.Module):
             strategy=context_strategy
         )
 
-        # 3. 编码测试子图
+        # 3. Encode test subgraph
         test_embedding = self._encode_subgraph(test_subgraph, target_entity, prediction_time)
 
-        # 4. 编码上下文
+        # 4. Encode context
         context_embeddings = []
         context_labels = []
         context_entities = []
@@ -167,7 +167,7 @@ class KumoRFM(nn.Module):
             context_entities.append(ctx.entity)
             context_timestamps.append(ctx.timestamp.timestamp())
 
-        # 5. 应用双重上下文机制
+        # 5. Apply dual context mechanism
         if context_embeddings:
             context_tensor = torch.stack(context_embeddings).unsqueeze(0)
             context_labels_tensor = self._process_labels(context_labels, task_config)
@@ -186,7 +186,7 @@ class KumoRFM(nn.Module):
         else:
             attention_weights = {}
 
-        # 6. ICL推理
+        # 6. ICL inference
         predictions = self.icl_module(
             context_embeddings,
             context_labels,
@@ -195,10 +195,10 @@ class KumoRFM(nn.Module):
             metadata={'task_config': task_config}
         )
 
-        # 7. 后处理
+        # 7. Post-processing
         results = self._postprocess_predictions(predictions, task_config)
 
-        # 添加注意力权重和其他信息
+        # Add attention weights and other information
         results['attention_weights'] = attention_weights
         results['num_context_used'] = len(context_examples)
 
@@ -209,31 +209,31 @@ class KumoRFM(nn.Module):
                          target_entity: Tuple[str, int],
                          timestamp: datetime) -> torch.Tensor:
         """
-        编码子图
+        Encode subgraph
 
         Returns:
-            目标实体的最终表示
+            Final representation of target entity
         """
-        # 1. 多模态特征编码
+        # 1. Multimodal feature encoding
         node_features_dict = {}
 
         for node_type in subgraph.node_types:
             if node_type in subgraph.node_features:
-                # 已有特征
+                # Existing features
                 features = subgraph.node_features[node_type]
             else:
-                # 需要编码
-                # 这里简化处理，实际应该从原始数据编码
+                # Need encoding
+                # Simplified processing here, should encode from raw data in practice
                 num_nodes = subgraph.node_counts[node_type]
                 features = torch.randn(num_nodes, self.config.hidden_dim)
 
             node_features_dict[node_type] = features
 
-        # 2. 表内编码
+        # 2. Intra-table encoding
         table_embeddings = self.table_encoder(node_features_dict)
 
-        # 3. 准备RelGT输入
-        # 合并所有节点
+        # 3. Prepare RelGT input
+        # Merge all nodes
         all_node_features = []
         all_node_types = []
         node_id_mapping = {}
@@ -246,14 +246,14 @@ class KumoRFM(nn.Module):
             all_node_features.append(node_features)
             all_node_types.extend([i] * num_nodes)
 
-            # 记录ID映射
+            # Record ID mapping
             node_id_mapping[node_type] = (offset, offset + num_nodes)
             offset += num_nodes
 
         all_node_features = torch.cat(all_node_features, dim=0)
         all_node_types = torch.tensor(all_node_types)
 
-        # 合并所有边
+        # Merge all edges
         all_edges = []
         all_edge_types = []
 
@@ -262,7 +262,7 @@ class KumoRFM(nn.Module):
                 source_type, _, target_type = edge_type
                 edge_index = subgraph.edge_indices[edge_type]
 
-                # 转换节点ID
+                # Convert node IDs
                 source_offset = node_id_mapping[source_type][0]
                 target_offset = node_id_mapping[target_type][0]
 
@@ -280,14 +280,14 @@ class KumoRFM(nn.Module):
             all_edge_index = torch.zeros((2, 0), dtype=torch.long)
             all_edge_types = torch.zeros(0, dtype=torch.long)
 
-        # 4. 多元素Token化
-        # 获取跳数信息
+        # 4. Multi-element tokenization
+        # Get hop distance information
         hop_distances = self._get_hop_distances(subgraph, target_entity, node_id_mapping)
 
-        # 获取时间差
+        # Get time differences
         time_diffs = self._get_time_differences(subgraph, timestamp, node_id_mapping)
 
-        # Token化
+        # Tokenization
         tokenized_features = self.tokenizer(
             all_node_features,
             all_node_types,
@@ -297,7 +297,7 @@ class KumoRFM(nn.Module):
             all_edge_types
         )
 
-        # 5. RelGT处理
+        # 5. RelGT processing
         node_embeddings = self.relgt(
             tokenized_features,
             all_edge_index,
@@ -305,7 +305,7 @@ class KumoRFM(nn.Module):
             all_edge_types
         )
 
-        # 6. 提取目标实体的嵌入
+        # 6. Extract target entity embedding
         target_node_type, target_node_id = target_entity
         if target_node_type in node_id_mapping:
             start, end = node_id_mapping[target_node_type]
@@ -314,7 +314,7 @@ class KumoRFM(nn.Module):
             if 0 <= global_target_id < node_embeddings.shape[0]:
                 target_embedding = node_embeddings[global_target_id]
             else:
-                # 目标节点不在子图中，使用零向量
+                # Target node not in subgraph, use zero vector
                 target_embedding = torch.zeros(self.config.hidden_dim)
         else:
             target_embedding = torch.zeros(self.config.hidden_dim)
@@ -325,11 +325,11 @@ class KumoRFM(nn.Module):
                            subgraph: TemporalHeterogeneousGraph,
                            target_entity: Tuple[str, int],
                            node_id_mapping: Dict[str, Tuple[int, int]]) -> torch.Tensor:
-        """获取所有节点的跳数距离"""
+        """Get hop distances for all nodes"""
         total_nodes = sum(subgraph.node_counts.values())
-        hop_distances = torch.ones(total_nodes) * 3  # 默认最大跳数
+        hop_distances = torch.ones(total_nodes) * 3  # default max hops
 
-        # 从子图属性中获取跳数信息
+        # Get hop information from subgraph attributes
         for node_type in subgraph.node_types:
             if hasattr(subgraph, f'{node_type}_hop_distances'):
                 hop_tensor = getattr(subgraph, f'{node_type}_hop_distances')
@@ -342,7 +342,7 @@ class KumoRFM(nn.Module):
                               subgraph: TemporalHeterogeneousGraph,
                               prediction_time: datetime,
                               node_id_mapping: Dict[str, Tuple[int, int]]) -> torch.Tensor:
-        """计算时间差"""
+        """Calculate time differences"""
         total_nodes = sum(subgraph.node_counts.values())
         time_diffs = torch.zeros(total_nodes)
 
@@ -359,7 +359,7 @@ class KumoRFM(nn.Module):
     def _process_labels(self,
                         labels: List[Any],
                         task_config: TaskConfig) -> torch.Tensor:
-        """处理标签数据"""
+        """Process label data"""
         if not labels:
             return torch.zeros(0)
 
@@ -375,34 +375,34 @@ class KumoRFM(nn.Module):
     def _postprocess_predictions(self,
                                  predictions: torch.Tensor,
                                  task_config: TaskConfig) -> Dict[str, Any]:
-        """后处理预测结果"""
+        """Post-process prediction results"""
         results = {}
 
         if task_config.task_type == 'classification':
-            # 分类：softmax得到概率
+            # Classification: softmax to get probabilities
             probs = torch.softmax(predictions, dim=-1)
             results['probabilities'] = probs.detach().cpu().numpy()
             results['predicted_class'] = torch.argmax(probs, dim=-1).item()
 
         elif task_config.task_type == 'regression':
-            # 回归：直接输出
+            # Regression: direct output
             results['predicted_value'] = predictions.detach().cpu().item()
 
         elif task_config.task_type == 'multilabel':
-            # 多标签：sigmoid得到概率
+            # Multi-label: sigmoid to get probabilities
             probs = torch.sigmoid(predictions)
             results['probabilities'] = probs.detach().cpu().numpy()
             results['predicted_labels'] = (probs > 0.5).int().detach().cpu().numpy()
 
         elif task_config.task_type == 'link_prediction':
-            # 链接预测：返回嵌入
+            # Link prediction: return embeddings
             results['node_embedding'] = predictions.detach().cpu().numpy()
 
         return results
 
     def set_task_config(self, task_config: TaskConfig):
-        """更新任务配置"""
-        # 如果需要更新任务头（如类别数变化）
+        """Update task configuration"""
+        # Update task head if needed (e.g., number of classes changed)
         if task_config.task_type == 'classification' and task_config.num_classes:
             self.icl_module.register_task_head(
                 'classification',
@@ -410,5 +410,5 @@ class KumoRFM(nn.Module):
             )
 
         elif task_config.task_type == 'multilabel' and task_config.num_labels:
-            # 可以添加多标签任务头
+            # Can add multi-label task head
             pass

@@ -1,0 +1,2 @@
+[console_scripts]
+kumorfm-demo = examples.demo:main

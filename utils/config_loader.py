@@ -1,6 +1,6 @@
 """
-配置文件加载器
-从YAML文件加载配置
+Configuration File Loader
+Load configurations from YAML files
 """
 
 import yaml
@@ -18,11 +18,11 @@ from config.model_config import (
 
 
 class ConfigLoader:
-    """配置加载器"""
+    """Configuration Loader"""
 
     @staticmethod
     def load_yaml(config_path: str) -> Dict[str, Any]:
-        """加载YAML配置文件"""
+        """Load YAML configuration file"""
         path = Path(config_path)
         if not path.exists():
             raise FileNotFoundError(f"配置文件不存在: {config_path}")

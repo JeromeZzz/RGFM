@@ -22,29 +22,29 @@ from utils.training_utils import set_random_seed
 
 
 def create_mock_data():
-    """创建模拟数据用于演示"""
-    print("创建模拟数据...")
+    """Create mock data for demonstration"""
+    print("Creating mock data...")
 
-    # 创建用户表
+    # Create users table
     users_data = {
         'user_id': range(100),
         'age': np.random.randint(18, 65, 100),
         'gender': np.random.choice(['M', 'F'], 100),
-        'city': np.random.choice(['北京', '上海', '广州', '深圳'], 100),
+        'city': np.random.choice(['Beijing', 'Shanghai', 'Guangzhou', 'Shenzhen'], 100),
         'registration_date': pd.date_range('2020-01-01', periods=100, freq='D')
     }
     users_df = pd.DataFrame(users_data)
 
-    # 创建商品表
+    # Create items table
     items_data = {
         'item_id': range(200),
-        'category': np.random.choice(['电子', '服装', '食品', '图书'], 200),
+        'category': np.random.choice(['Electronics', 'Clothing', 'Food', 'Books'], 200),
         'price': np.random.uniform(10, 1000, 200),
-        'brand': np.random.choice(['品牌A', '品牌B', '品牌C'], 200)
+        'brand': np.random.choice(['Brand_A', 'Brand_B', 'Brand_C'], 200)
     }
     items_df = pd.DataFrame(items_data)
 
-    # 创建交易表
+    # Create transactions table
     transactions = []
     for _ in range(1000):
         user_id = np.random.randint(0, 100)
@@ -66,22 +66,22 @@ def create_mock_data():
 
 
 def demo_basic_prediction():
-    """演示基本预测功能"""
-    print("\n=== 基本预测演示 ===")
+    """Demonstrate basic prediction functionality"""
+    print("\n=== Basic Prediction Demo ===")
 
-    # 设置随机种子
+    # Set random seed
     set_random_seed(42)
 
-    # 创建模拟数据
+    # Create mock data
     users_df, items_df, transactions_df = create_mock_data()
 
-    # 创建数据库
+    # Create database
     database = MockDatabase()
     database.tables['users'] = users_df
     database.tables['items'] = items_df
     database.tables['transactions'] = transactions_df
 
-    # 定义数据库模式
+    # Define database schema
     database_schema = {
         'users': {
             'user_id': 'categorical',
@@ -105,13 +105,13 @@ def demo_basic_prediction():
         }
     }
 
-    # 创建图转换器
+    # Create graph converter
     converter = MockGraphConverter()
     graph = converter.convert(database)
 
-    print(f"创建的图: {graph}")
+    print(f"Created graph: {graph}")
 
-    # 创建模型配置
+    # Create model configuration
     config = KumoRFMConfig(
         hidden_dim=128,
         num_layers=2,
@@ -120,13 +120,13 @@ def demo_basic_prediction():
         num_hops=2
     )
 
-    # 创建模型
+    # Create model
     model = KumoRFM(config, database_schema)
 
-    # 创建预测器
+    # Create predictor
     predictor = KumoRFMPredictor(model, config)
 
-    # 定义任务：预测用户下个月的购买金额
+    # Define task: predict user's purchase amount next month
     task_config = TaskConfig(
         task_type='regression',
         target_column='amount',
@@ -135,11 +135,11 @@ def demo_basic_prediction():
         time_window_end=0
     )
 
-    # 预测
-    target_entity = ('users', 0)  # 用户0
+    # Prediction
+    target_entity = ('users', 0)  # User 0
     prediction_time = datetime.now()
 
-    print(f"\n预测用户 {target_entity[1]} 在 {prediction_time.date()} 的购买金额...")
+    print(f"\nPredicting purchase amount for user {target_entity[1]} on {prediction_time.date()}...")
 
     result = predictor.predict(
         graph,
@@ -149,55 +149,55 @@ def demo_basic_prediction():
         num_context=5
     )
 
-    print(f"预测结果: {result['predicted_value']:.2f}")
-    print(f"使用的上下文数量: {result['num_context_used']}")
+    print(f"Prediction result: {result['predicted_value']:.2f}")
+    print(f"Number of contexts used: {result['num_context_used']}")
 
     return model, database, graph
 
 
 def demo_pql_prediction():
-    """演示使用PQL进行预测"""
-    print("\n=== PQL预测演示 ===")
+    """Demonstrate PQL prediction"""
+    print("\n=== PQL Prediction Demo ===")
 
-    # 创建模型和数据
+    # Create model and data
     model, database, graph = demo_basic_prediction()
 
-    # 创建PQL查询
+    # Create PQL query
     pql_query = """
     PREDICT SUM(amount, -30, 0) > 1000
     FOR EACH user_id IN (0, 1, 2, 3, 4)
-    WHERE city = '北京'
+    WHERE city = 'Beijing'
     """
 
-    print(f"\nPQL查询: {pql_query}")
+    print(f"\nPQL query: {pql_query}")
 
-    # 创建预测器
+    # Create predictor
     predictor = KumoRFMPredictor(model, model.config)
 
-    # 执行PQL预测
+    # Execute PQL prediction
     results = predictor.predict_from_pql(
         database,
         graph,
         pql_query
     )
 
-    print("\n预测结果:")
+    print("\nPrediction results:")
     for user_id, result in results.items():
         if user_id != '_aggregated':
-            print(f"  用户 {user_id}: {result.get('predicted_value', 'N/A'):.2f}")
+            print(f"  User {user_id}: {result.get('predicted_value', 'N/A'):.2f}")
 
     if '_aggregated' in results:
-        print(f"\n聚合结果: {results['_aggregated']}")
+        print(f"\nAggregated result: {results['_aggregated']}")
 
 
 def demo_batch_prediction():
-    """演示批量预测"""
-    print("\n=== 批量预测演示 ===")
+    """Demonstrate batch prediction"""
+    print("\n=== Batch Prediction Demo ===")
 
-    # 创建模型和数据
+    # Create model and data
     model, database, graph = demo_basic_prediction()
 
-    # 准备批量预测
+    # Prepare batch prediction
     entities = [('users', i) for i in range(10)]
     prediction_time = datetime.now()
 
@@ -207,10 +207,10 @@ def demo_batch_prediction():
         num_classes=2
     )
 
-    # 创建预测器
+    # Create predictor
     predictor = KumoRFMPredictor(model, model.config)
 
-    print(f"\n批量预测 {len(entities)} 个用户...")
+    print(f"\nBatch predicting {len(entities)} users...")
 
     results = predictor.batch_predict(
         graph,
@@ -220,17 +220,17 @@ def demo_batch_prediction():
         batch_size=5
     )
 
-    # 统计结果
+    # Statistics of results
     positive_count = sum(1 for r in results if r.get('predicted_class', 0) == 1)
-    print(f"\n预测结果统计:")
-    print(f"  预测会购买的用户数: {positive_count}")
-    print(f"  预测不会购买的用户数: {len(results) - positive_count}")
+    print(f"\nPrediction result statistics:")
+    print(f"  Users predicted to purchase: {positive_count}")
+    print(f"  Users predicted not to purchase: {len(results) - positive_count}")
 
-    # 显示前5个结果
-    print("\n前5个预测结果:")
+    # Show first 5 results
+    print("\nFirst 5 prediction results:")
     for i, result in enumerate(results[:5]):
-        print(f"  用户 {i}: 类别={result['predicted_class']}, "
-              f"置信度={result.get('confidence', 0):.3f}")
+        print(f"  User {i}: class={result['predicted_class']}, "
+              f"confidence={result.get('confidence', 0):.3f}")
 
 
 def demo_finetuning():

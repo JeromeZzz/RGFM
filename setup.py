@@ -5,22 +5,22 @@ KumoRFM安装配置
 from setuptools import setup, find_packages
 from pathlib import Path
 
-# 读取README
+# Read README
 this_directory = Path(__file__).parent
 long_description = (this_directory / "README.md").read_text(encoding='utf-8')
 
-# 读取requirements
+# Read requirements
 with open('requirements.txt') as f:
     required = f.read().splitlines()
-    # 过滤注释和空行
+    # Filter comments and empty lines
     required = [line for line in required if line and not line.startswith('#')]
 
 setup(
     name="kumorfm",
     version="0.1.0",
-    author="KumoRFM Team",
-    author_email="kumorfm@example.com",
-    description="KumoRFM: 关系数据基础模型",
+    author="Weizun Zhao",
+    author_email="wzzhao@iaii.ac.cn",
+    description="KumoRFM: Relational Data Foundation Model",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/yourusername/kumorfm",
