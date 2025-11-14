@@ -16,12 +16,12 @@ RGFM（Relational Graph Foundation Model）是一个端到端的关系图基础�
 
 ```mermaid
 flowchart LR
-    A[RelBench 数据/合成数据] --> B[数据适配器\nrelbdata/adapter.py]
-    B --> C[在线上下文标签表\nsampling/context_label_table.py]
-    C --> D[ContextSampler + BackwardSampler\nsampling/context_sampler.py]
-    D --> E[RelGT 编码\nmodels/kumorfm.py]
-    E --> F[上下文学习/任务头\nmodels/icl/*]
-    F --> G[训练器 & 评估\nrelbdata/train_on_relbench.py]
+    A[RelBench 数据/合成数据] --> B[数据适配器\n relbdata/adapter.py]
+    B --> C[在线上下文标签表\n sampling/context_label_table.py]
+    C --> D[ContextSampler + BackwardSampler\n sampling/context_sampler.py]
+    D --> E[RelGT 编码\n models/kumorfm.py]
+    E --> F[上下文学习/任务头\n models/icl/*]
+    F --> G[训练器 & 评估\n relbdata/train_on_relbench.py]
     G --> H[输出 relbench_outputs/*]
 ```
 
