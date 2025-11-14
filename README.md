@@ -12,18 +12,6 @@ RGFM（Relational Graph Foundation Model）是一个端到端的关系图基础�
 - **Dry-Run 流水线**：无需 RelBench 数据即可运行完整训练流程，方便调试与验证。
 - **健壮的训练工具**：AdamW 优化器、余弦学习率调度、指标记录、模型保存以及可调超参数。
 
-## 项目流程概览
-
-```mermaid
-flowchart LR
-    A[RelBench 数据/合成数据] --> B[数据适配器\n relbdata/adapter.py]
-    B --> C[在线上下文标签表\n sampling/context_label_table.py]
-    C --> D[ContextSampler + BackwardSampler\n sampling/context_sampler.py]
-    D --> E[RelGT 编码\n models/kumorfm.py]
-    E --> F[上下文学习/任务头\n models/icl/*]
-    F --> G[训练器 & 评估\n relbdata/train_on_relbench.py]
-    G --> H[输出 relbench_outputs/*]
-```
 
 1. **数据适配器**（`relbdata/adapter.py`）  
    加载 RelBench 数据、推断数据库模式、构建时序异构图、生成训练/验证/测试拆分。
