@@ -1,33 +1,44 @@
-# RGFM: 关系数据基础模型
+# RGFM：关系图基础模型
 
-[![Python Version](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/downloads/)
-[![PyTorch](https://img.shields.io/badge/pytorch-2.0%2B-red)](https://pytorch.org/)
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+RGFM（Relational Graph Foundation Model）是一个端到端的关系图基础模型框架，专门用于处理多表多列的关系数据并在时序异构图上进行训练和推理。项目集成了 RelBench 数据集、真实的 RelGT（Relational Graph Transformer）编码器以及上下文学习（ICL）预测头，能够在无需编写任务专用代码的情况下完成多种预测任务。
 
-RGFM 是一个基于深度学习的关系数据基础模型，专门设计用于处理时序异构图数据。它结合了最先进的图神经网络技术和上下文学习机制，能够在各种关系数据预测任务上实现优异的性能。
+> **说明**：原始代码基于 “Kumo” 命名，本版本已统一更名为 “RGFM”，功能保持不变。
 
-## 主要特性
+## 核心特性
 
-- **零样本泛化**: 无需任务特定训练即可处理新的预测任务
-- **多模态编码**: 支持数值、类别、文本、时间等多种数据类型
-- **上下文学习**: 通过历史示例进行模式识别和预测
-- **灵活的任务支持**: 分类、回归、链接预测等多种任务
-- **PQL查询接口**: 使用预测查询语言(PQL)定义任务
-- **集成RelGT**: 利用关系图变换器进行深度图表示学习
+- **RelBench 数据支持**：自动加载并转换官方 RelBench 数据集，构建时序异构图并完成任务配置。
+- **RelGT 五元素编码**：直接接入 RelGT 官方 LocalModule，通过特征、类型、跳数、时间、结构等五种元素形成子图序列后再编码。
+- **ICL 预测头**：结合上下文采样、双重上下文注意力和标签编码，实现分类、回归或链接预测等任务。
+- **Dry-Run 流水线**：无需 RelBench 数据即可运行完整训练流程，方便调试与验证。
+- **健壮的训练工具**：AdamW 优化器、余弦学习率调度、指标记录、模型保存以及可调超参数。
 
-##  架构概览
+## 项目流程概览
 
-RGFM采用五阶段处理流程：
+```mermaid
+flowchart LR
+    A[RelBench 数据/合成数据] --> B[数据适配器\nrelbdata/adapter.py]
+    B --> C[在线上下文标签表\nsampling/context_label_table.py]
+    C --> D[ContextSampler + BackwardSampler\nsampling/context_sampler.py]
+    D --> E[RelGT 编码\nmodels/kumorfm.py]
+    E --> F[上下文学习/任务头\nmodels/icl/*]
+    F --> G[训练器 & 评估\nrelbdata/train_on_relbench.py]
+    G --> H[输出 relbench_outputs/*]
+```
 
-1. **动态子图采样**: 从时序异构图中采样相关的历史子图
-2. **多模态特征编码**: 统一编码不同类型的数据
-3. **关系图变换器(RelGT)**: 深度图神经网络处理
-4. **上下文学习(ICL)**: 利用历史模式进行预测
-5. **任务特定输出**: 根据任务类型生成预测结果
+1. **数据适配器**（`relbdata/adapter.py`）  
+   加载 RelBench 数据、推断数据库模式、构建时序异构图、生成训练/验证/测试拆分。
+2. **在线上下文标签生成**（`sampling/context_label_table.py`）  
+   `ForwardLabelSampler` 将 train/val 标签导入 `InContextLabelTable`，支持 `uniform`、`most_recent`、`fixed_interval` 策略。
+3. **子图采样**（`sampling/backward_sampler.py`, `sampling/context_sampler.py`）  
+   Backward 采样器抽取目标子图；ContextSampler 优先使用标签表生成上下文，缺失时回退旧策略。
+4. **RelGT 编码**（`models/kumorfm.py`）  
+   表级特征合并成 token，叠加节点类型/跳数/时间编码后输入真实的 RelGT LocalModule。
+5. **ICL 模块**（`models/icl/`）  
+   构建上下文序列、编码标签、通过 ICL Transformer 与任务头得到 logits / 输出。
+6. **训练脚本**（`relbdata/train_on_relbench.py`）  
+   统一的 CLI，支持 dry-run、自定义所有核心超参，并将模型/日志/结果写入 `relbench_outputs/`。
 
-##  安装
-
-### 基础安装
+## 安装步骤
 
 ```bash
 # 克隆仓库
@@ -37,210 +48,155 @@ cd RGFM
 # 安装依赖
 pip install -r requirements.txt
 
-# 安装KumoRFM
+# 以开发模式安装本项目
 pip install -e .
 ```
 
-### 安装RelGT（可选但推荐）
+### 可选：安装官方 RelGT 仓库
 
 ```bash
-# 克隆RelGT
 git clone https://github.com/snap-stanford/relgt.git models/relgt/relgt
-
-# 安装RelGT依赖
 pip install -r models/relgt/relgt/requirements.txt
 ```
 
-### 开发安装
+> 如果环境中缺少 `torch_geometric` / `torch_frame`，RGFM 会自动退回到内置的轻量编码器以保证流程可运行。
+
+## 准备 RelBench 数据
+
+1. 按官方指南下载 RelBench 数据集，放置在 `relbdata/adapter.py` 可访问的位置（默认 `~/.relbench` 或通过环境变量指定目录）。
+2. 支持的数据集名称：`amazon`、`stack`、`f1`、`trial`、`avito`、`event`、`hm`（公共版建议使用 `trial`）。
+3. 任务名称依据数据集而定，参见 `relbdata/__init__.py:DATASET_TASKS`；若不确定，可使用 `--task auto` 自动推断或回退。
+
+## 运行训练
+
+主要入口为 `relbdata/train_on_relbench.py`。
+
+### 1）Dry-Run（无需 RelBench 数据）
 
 ```bash
-# 安装开发依赖
-pip install -e ".[dev]"
-
-# 安装可视化工具
-pip install -e ".[viz]"
-
-# 安装高级功能
-pip install -e ".[advanced]"
+python -u relbdata/train_on_relbench.py \
+  --dataset trial --task auto \
+  --epochs 1 --batch-size 4 \
+  --device cpu --dry-run
 ```
 
-##  快速开始
+该命令会构建一个极小图，跑完训练/验证/测试流程，并在 `relbench_outputs/trial_auto_<时间戳>/` 下生成输出。
 
-### 基本预测示例
-
-```python
-from kumorfm import KumoRFM, KumoRFMPredictor
-from kumorfm.config import KumoRFMConfig, TaskConfig
-from datetime import datetime
-
-# 创建配置
-config = KumoRFMConfig(
-    hidden_dim=256,
-    num_layers=4,
-    num_heads=8
-)
-
-# 定义数据库模式
-database_schema = {
-    'users': {'user_id': 'categorical', 'age': 'numerical'},
-    'items': {'item_id': 'categorical', 'price': 'numerical'},
-    'transactions': {'user_id': 'categorical', 'item_id': 'categorical', 
-                     'amount': 'numerical', 'timestamp': 'time'}
-}
-
-# 创建模型
-model = KumoRFM(config, database_schema)
-
-# 创建预测器
-predictor = KumoRFMPredictor(model, config)
-
-# 定义任务：预测用户下周的购买金额
-task_config = TaskConfig(
-    task_type='regression',
-    target_column='amount',
-    aggregation='sum',
-    time_window_start=-7,
-    time_window_end=0
-)
-
-# 执行预测
-result = predictor.predict(
-    graph,  # 时序异构图
-    target_entity=('users', 123),  # 用户123
-    prediction_time=datetime.now(),
-    task_config=task_config
-)
-
-print(f"预测金额: {result['predicted_value']:.2f}")
-```
-
-### 使用PQL查询
-
-```python
-# 使用PQL定义预测任务
-pql_query = """
-PREDICT SUM(sales, -30, 0) > 1000
-FOR EACH store_id IN (1, 2, 3, 4, 5)
-WHERE region = 'North'
-"""
-
-# 执行PQL预测
-results = predictor.predict_from_pql(
-    database,
-    graph,
-    pql_query
-)
-
-# 查看结果
-for store_id, result in results.items():
-    print(f"店铺 {store_id}: {result['predicted_value']}")
-```
-
-### 模型微调
-
-```python
-from kumorfm.training import finetune_kumorfm
-
-# 为特定任务微调模型
-results = finetune_kumorfm(
-    model,
-    database,
-    graph,
-    pql_query,
-    config,
-    task_config,
-    experiment_config,
-    freeze_backbone=True  # 冻结骨干网络
-)
-
-print(f"测试MAE: {results['test_results']['mae']:.4f}")
-```
-
-##  运行演示
+### 2）RelBench 真实训练（GPU）
 
 ```bash
-# 运行完整演示
-python examples/demo.py
-
-# 或使用命令行
-kumorfm-demo
+python -u relbdata/train_on_relbench.py \
+  --dataset trial \
+  --task auto \
+  --hidden-dim 256 \
+  --num-layers 4 \
+  --num-heads 8 \
+  --dropout 0.3 \
+  --epochs 20 \
+  --batch-size 16 \
+  --lr 2e-4 \
+  --early-stopping-patience 6 \
+  --device cuda \
+  --seed 42 \
+  --output-dir ./relbench_outputs \
+  --dry-run             # 如需快速链路验证可开启，真实训练请移除
 ```
 
-演示包括：
-- 基本预测
-- PQL查询
-- 批量预测
-- 模型微调
-- 注意力可视化
-- 模型保存和加载
+可调节参数总览：
 
-## 🔧 配置说明
+| 参数 | 说明 |
+| --- | --- |
+| `--dataset {amazon,stack,f1,trial,avito,event,hm}` | RelBench 数据集名称 |
+| `--task TASK` | 任务名称（`auto` 自动推断） |
+| `--hidden-dim` | 模型隐藏维度 |
+| `--num-layers` | RelGT 层数 |
+| `--num-heads` | 注意力头数 |
+| `--dropout` | Dropout 概率 |
+| `--epochs` | 训练轮数 |
+| `--batch-size` | 批大小 |
+| `--lr` | 学习率（AdamW） |
+| `--early-stopping-patience` | 早停耐心 |
+| `--device {cuda,cpu}` | 训练设备 |
+| `--seed` | 随机种子 |
+| `--output-dir` | 结果/模型输出目录 |
+| `--dry-run` | 启用小型合成数据验证链接 |
 
-### 模型配置 (KumoRFMConfig)
+常用超参数范围：
 
-```python
-config = KumoRFMConfig(
-    # 模型架构
-    hidden_dim=256,          # 隐藏层维度
-    num_layers=4,            # RelGT层数
-    num_heads=8,             # 注意力头数
-    
-    # 采样参数
-    max_neighbors=300,       # 最大邻居数
-    num_hops=2,              # 采样跳数
-    context_window_size=10,  # 上下文示例数
-    
-    # 训练参数
-    learning_rate=1e-4,      # 学习率
-    dropout_rate=0.3,        # Dropout率
-    batch_size=256           # 批次大小
-)
+| 参数 | 推荐区间 | 说明 |
+| --- | --- | --- |
+| `--hidden-dim` | 128–384 | RelGT 与 ICL 层的宽度 |
+| `--num-layers` | 2–6 | RelGT 层数 |
+| `--num-heads` | 4–8 | 注意力头数 |
+| `--dropout` | 0.1–0.5 | 正则力度，过拟合时调高 |
+| `--lr` | 1e-4 – 3e-4 | AdamW 学习率 |
+| `--batch-size` | 8–64 | 视显存而定 |
+
+### 3）定位 CUDA 设备断言
+
+在 PowerShell 中启用同步执行：
+
+```powershell
+$env:CUDA_LAUNCH_BLOCKING = '1'
+python -u relbdata/train_on_relbench.py --dataset trial --task auto --epochs 1 --batch-size 8 --device cuda
+Remove-Item Env:CUDA_LAUNCH_BLOCKING -ErrorAction SilentlyContinue
 ```
 
-### 任务配置 (TaskConfig)
-
-```python
-task_config = TaskConfig(
-    task_type='classification',    # 任务类型
-    num_classes=5,                 # 类别数
-    target_column='label',         # 目标列
-    aggregation='mean',            # 聚合方式
-    time_window_start=-7,          # 时间窗口开始（天）
-    time_window_end=0              # 时间窗口结束（天）
-)
-```
-
-##  项目结构
+## 仓库结构
 
 ```
-kumorfm/
-├── config/              # 配置模块
-├── data/                # 数据处理
-├── pql/                 # PQL解析器
-├── sampling/            # 子图采样
-├── models/              # 模型实现
-│   ├── encoders/        # 编码器
-│   ├── relgt/           # RelGT集成
-│   ├── icl/             # 上下文学习
-│   └── kumorfm.py       # 主模型
-├── training/            # 训练模块
-├── inference/           # 推理模块
-├── utils/               # 工具函数
-└── examples/            # 示例代码
+RGFM/
+├── config/                 # 模型与任务配置
+├── data/                   # 时序图数据结构
+├── relbdata/               # RelBench 适配器、训练脚本、分析工具
+├── sampling/               # 子图与上下文采样
+├── models/
+│   ├── kumorfm.py          # RGFM 主模型（RelGT + ICL）
+│   ├── encoders/           # 表/多模态编码器
+│   ├── relgt/              # RelGT 集成与封装
+│   └── icl/                # 上下文学习模块
+├── training/               # 通用训练工具
+├── inference/              # 推理接口（可选）
+├── utils/                  # 日志与训练辅助
+└── examples/               # 示例脚本
 ```
 
-##  技术细节
+## 全流程示意
 
-### 多元素Token化
+```
+多源关系数据库
+       │
+       ▼
+数据预处理 → 图表示 G(V,E)
+       │
+       ▼
+表无关编码器 → 多模态嵌入
+       │
+       ▼
+Relational Graph Transformer
+       │
+       ▼
+上下文采样生成 {(G≤t̂[ê], ŷ)}
+       │
+       ▼
+上下文学习训练 (预训练)
+       │
+       ├──► 推理阶段 (ICL)
+       │       └─ 动态预测 + 可解释输出
+       │
+       └──► 微调阶段 (Fine-tuning)
+               └─ 任务特化训练 + 缓存加速
+```
 
-每个节点被分解为5个元素：
-1. **节点特征**: 多模态编码后的特征
-2. **节点类型**: 表类型的one-hot编码
-3. **跳跃距离**: 与目标节点的结构距离
-4. **相对时间**: 与预测时间的时间差
-5. **子图结构**: 局部图结构编码
 
-### 双重上下文机制
 
-- **实体内上下文**: 关注目标实体自身的历史
-- **子图间上下文**: 捕获不同历史快照间的模式
+## 常见问题与排查
+
+- **无法找到数据集**：确认 RelBench 数据已下载且路径正确，适配器会依次尝试 `trial`、`rel-trial`、`stack` 等名称。
+- **标签越界**：RGFM 会将分类标签映射为连续索引并动态扩展标签嵌入，如仍报错，可检查 `relbdata/train_on_relbench.py:569-572` 的推断逻辑。
+- **子图过小导致 RelGT 不稳定**：封装器会在序列长度小于 2 时自动复制 token 并在小批量下切换到 eval 模式。如图过于稀疏，请增大采样跳数或邻居数。
+- **仅需推理**：可使用 `inference/predictor.py` 加载已训练模型执行预测（同样以 RGFM 命名）。
+
+## 许可证
+
+本项目以 MIT License 方式开源，详细内容见 [`LICENSE`](LICENSE)。
