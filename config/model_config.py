@@ -53,6 +53,9 @@ class SamplingConfig:
     strategy: str = 'temporal_importance'  # 'random', 'temporal_importance', 'structure_aware'
     max_neighbors_per_hop: List[int] = None  # max neighbors per hop
     time_decay_factor: float = 0.9  # time decay factor
+    num_hops: int = 2
+    max_neighbors: int = 300
+    context_sampling_interval_seconds: float = 86400.0
 
     def __post_init__(self):
         if self.max_neighbors_per_hop is None:
@@ -75,6 +78,7 @@ class ColumnEncoderConfig:
     text_model_name: str = 'sentence-transformers/all-MiniLM-L6-v2'
     text_max_length: int = 512
     text_pooling: str = 'mean'  # 'mean', 'max', 'cls'
+    text_embedding_dim: int = 768
 
     # Time
     time_embedding_dim: int = 64
