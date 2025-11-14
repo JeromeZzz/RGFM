@@ -161,6 +161,8 @@ class IntraEntityAttention(nn.Module):
         # 应用实体掩码和相关性分数
         scores = scores + relevance_scores.unsqueeze(1)
         if entity_mask is not None:
+            # Ensure mask on the same device as scores
+            entity_mask = entity_mask.to(scores.device)
             scores = scores.masked_fill(~entity_mask.unsqueeze(0).unsqueeze(1), float('-inf'))
 
         # 注意力权重

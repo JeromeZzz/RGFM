@@ -33,22 +33,39 @@ from .adapter import (
     get_database_schema_from_relbench
 )
 
-from .train_on_relbench import (
-    RelBenchDataset,
-    RelBenchTrainer,
-    collate_fn,
-    main as train_on_relbench
-)
+# Training and analysis components are optional on import to avoid
+# pulling heavy or optional dependencies when not needed.
+try:
+    from .train_on_relbench import (
+        RelBenchDataset,
+        RelBenchTrainer,
+        collate_fn,
+        main as train_on_relbench
+    )
+except Exception:  # keep import-time robust for adapter usage
+    RelBenchDataset = None
+    RelBenchTrainer = None
+    collate_fn = None
+    train_on_relbench = None
 
-from .analyze_results import (
-    load_results,
-    load_all_results,
-    create_comparison_table,
-    plot_metric_comparison,
-    plot_hyperparameter_impact,
-    analyze_training_efficiency,
-    generate_report
-)
+try:
+    from .analyze_results import (
+        load_results,
+        load_all_results,
+        create_comparison_table,
+        plot_metric_comparison,
+        plot_hyperparameter_impact,
+        analyze_training_efficiency,
+        generate_report
+    )
+except Exception:
+    load_results = None
+    load_all_results = None
+    create_comparison_table = None
+    plot_metric_comparison = None
+    plot_hyperparameter_impact = None
+    analyze_training_efficiency = None
+    generate_report = None
 
 # Version and metadata
 __version__ = "0.1.0"
@@ -63,14 +80,16 @@ __all__ = [
     "get_database_schema_from_relbench",
     
     # Training components
+    # Training components (may be None if optional import failed)
     "RelBenchDataset",
-    "RelBenchTrainer", 
+    "RelBenchTrainer",
     "collate_fn",
     "train_on_relbench",
     
     # Analysis utilities
+    # Analysis utilities (may be None if optional import failed)
     "load_results",
-    "load_all_results", 
+    "load_all_results",
     "create_comparison_table",
     "plot_metric_comparison",
     "plot_hyperparameter_impact",

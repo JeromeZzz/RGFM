@@ -5,6 +5,9 @@ Visualize and compare results from different experiments
 
 import json
 import pandas as pd
+# Use a non-interactive backend to avoid GUI pop-ups during analysis
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
@@ -367,7 +370,7 @@ def main():
     output_dir.mkdir(exist_ok=True)
 
     # Load all results
-    print(f"Loading results from {args.results-dir}...")
+    print(f"Loading results from {args.results_dir}...")
     results = load_all_results(args.results_dir)
 
     if not results:

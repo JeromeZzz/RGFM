@@ -21,6 +21,9 @@ class ICLModule(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_dim = config.hidden_dim
+        self._label_vocab = {}
+        self._label_vocab = {}
+        self._class_vocab = {}
         self.num_heads = config.icl_num_heads
         self.num_layers = config.icl_num_layers
 
@@ -112,8 +115,10 @@ class ICLModule(nn.Module):
         for layer in self.icl_layers:
             sequence = layer(sequence)
 
-        # 提取查询表示
+        # 提取查询表示 / Extract query representation
         query_output = sequence[:, -1, :]  # (batch_size, hidden_dim)
+        # Ensure on same device as module parameters
+        query_output = query_output.to(next(self.parameters()).device)
 
         # 应用任务头
         if task_type in self.task_heads:
@@ -186,17 +191,37 @@ class LabelEncoder(nn.Module):
         Returns:
             (batch_size, hidden_dim) 或 (hidden_dim,)
         """
+        # Ensure labels tensor lives on the same device as module params
+        device = next(self.parameters()).device
+        if not hasattr(self, "_label_vocab"):
+            self._label_vocab = {}
+
         if isinstance(labels, torch.Tensor):
             batch_size = labels.size(0) if labels.dim() > 0 else 1
+            labels = labels.to(device)
         else:
-            batch_size = 1
-            labels = torch.tensor(labels)
+            numeric_list = self._ensure_numeric_list(labels, as_int=False)
+            labels = torch.tensor(numeric_list, device=device)
+            batch_size = labels.size(0) if labels.dim() > 0 else 1
 
         if task_type == "classification":
-            # 分类任务
-            if labels.dim() == 0:
-                labels = labels.unsqueeze(0)
-            encoded = self.class_embedding(labels.long())
+            # 分类任务：确保标签为非负整数索引，并根据需要扩展嵌入表
+            numeric = self._ensure_numeric_list(labels, as_int=True)
+            labels = torch.tensor(numeric, device=device, dtype=torch.long).unsqueeze(0)
+            # clamp negatives (should not happen after dataset normalization)
+            if (labels < 0).any():
+                labels = labels.clamp_min(0)
+            # grow embedding if needed
+            if labels.numel() > 0:
+                max_label = int(labels.max().item())
+                num_emb = int(self.class_embedding.num_embeddings)
+                if max_label >= num_emb:
+                    new_size = max(max_label + 1, num_emb * 2)
+                    new_emb = nn.Embedding(new_size, self.hidden_dim).to(device)
+                    with torch.no_grad():
+                        new_emb.weight[:num_emb].copy_(self.class_embedding.weight.data)
+                    self.class_embedding = new_emb
+            encoded = self.class_embedding(labels)
 
         elif task_type == "regression":
             # 回归任务
@@ -212,26 +237,96 @@ class LabelEncoder(nn.Module):
                 labels = labels.unsqueeze(0)
             # 填充或截断到固定长度
             if labels.size(-1) < 100:
-                padding = torch.zeros(batch_size, 100 - labels.size(-1), device=labels.device)
+                padding = torch.zeros(batch_size, 100 - labels.size(-1), device=device)
                 labels = torch.cat([labels, padding], dim=-1)
             else:
                 labels = labels[:, :100]
             encoded = self.multilabel_encoder(labels.float())
 
         elif task_type == "link_prediction":
-            # 链接预测：将目标节点ID编码
-            if labels.dim() == 0:
-                labels = labels.unsqueeze(0)
-            encoded = self.class_embedding(labels.long())
+            # 链接预测：将目标节点ID编码（与分类同样的安全处理）
+            numeric = self._ensure_numeric_list(labels, as_int=True)
+            labels = torch.tensor(numeric, device=device, dtype=torch.long).unsqueeze(0)
+            if (labels < 0).any():
+                labels = labels.clamp_min(0)
+            if labels.numel() > 0:
+                max_label = int(labels.max().item())
+                num_emb = int(self.class_embedding.num_embeddings)
+                if max_label >= num_emb:
+                    new_size = max(max_label + 1, num_emb * 2)
+                    new_emb = nn.Embedding(new_size, self.hidden_dim).to(device)
+                    with torch.no_grad():
+                        new_emb.weight[:num_emb].copy_(self.class_embedding.weight.data)
+                    self.class_embedding = new_emb
+            encoded = self.class_embedding(labels)
 
         else:
             # 默认：零向量
-            encoded = torch.zeros(batch_size, self.hidden_dim, device=labels.device)
+            encoded = torch.zeros(batch_size, self.hidden_dim, device=device)
 
         if encoded.dim() > 2:
             encoded = encoded.squeeze(1)
 
         return encoded
+
+    def _ensure_numeric_list(self, labels: Any, as_int: bool = False) -> List[float]:
+        """
+        Convert labels (possibly nested lists, tensors, strings) into numeric lists.
+        """
+        result: List[float] = []
+
+        if isinstance(labels, torch.Tensor):
+            flat = labels.detach().cpu().view(-1).tolist()
+            for val in flat:
+                result.append(int(val) if as_int else float(val))
+            return result
+
+        if isinstance(labels, (list, tuple)):
+            for item in labels:
+                result.extend(self._ensure_numeric_list(item, as_int=as_int))
+            return result
+
+        if isinstance(labels, (int, float, bool)):
+            val = int(labels) if as_int else float(labels)
+            result.append(val)
+            return result
+
+        key = str(labels)
+        if key not in self._label_vocab:
+            self._label_vocab[key] = len(self._label_vocab)
+        mapped = self._label_vocab[key]
+        result.append(int(mapped) if as_int else float(mapped))
+        return result
+
+    def _to_class_indices(self, labels: Any, device: torch.device) -> torch.Tensor:
+        """Normalize arbitrary labels into contiguous integer indices."""
+        if isinstance(labels, torch.Tensor):
+            if labels.dim() == 0:
+                labels = labels.unsqueeze(0)
+            return labels.long().to(device)
+
+        if not isinstance(labels, (list, tuple)):
+            labels = [labels]
+
+        indices = []
+        for label in labels:
+            if isinstance(label, torch.Tensor):
+                if label.numel() == 1:
+                    label = label.item()
+                else:
+                    raise ValueError("Classification label tensor has more than one element")
+
+            if isinstance(label, (int, float)):
+                indices.append(int(label))
+            else:
+                key = str(label)
+                if key not in self._class_vocab:
+                    self._class_vocab[key] = len(self._class_vocab)
+                indices.append(self._class_vocab[key])
+
+        if not indices:
+            indices = [0]
+        return torch.tensor(indices, device=device, dtype=torch.long)
 
 
 class ICLTransformerLayer(nn.Module):

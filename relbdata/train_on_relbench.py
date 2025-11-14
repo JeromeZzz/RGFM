@@ -6,22 +6,32 @@ import argparse
 import logging
 import torch
 import numpy as np
+import pandas as pd
 from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
 import json
+import time
 from typing import Dict, Any, List, Tuple, Optional
 from torch.utils.data import Dataset, DataLoader
+
+# Ensure project root is importable when running this file directly
+import sys
+from pathlib import Path as _PathForSys
+_HERE = _PathForSys(__file__).resolve()
+_ROOT = _HERE.parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 from config.model_config import KumoRFMConfig, ExperimentConfig
 from models.kumorfm import KumoRFM
 from training.trainer import KumoRFMTrainer
-from inference.predictor import KumoRFMPredictor
 from utils.training_utils import set_random_seed
-from relbench.adapter import (
+from relbdata.adapter import (
     RelBenchAdapter,
     get_database_schema_from_relbench
 )
+from sampling.context_label_table import InContextLabelTable, ForwardLabelSampler
 
 # Setup logging
 logging.basicConfig(
@@ -44,9 +54,24 @@ class RelBenchDataset(Dataset):
                  task_config: 'TaskConfig'):
         self.graph = graph
         self.entities = entities
-        self.labels = torch.tensor(labels)
-        self.timestamps = timestamps
+        # Normalize labels based on task type
         self.task_config = task_config
+        labels_array = np.asarray(labels)
+        if task_config.task_type == 'classification':
+            # Always remap labels to contiguous indices [0..K-1]
+            labels_str = labels_array.astype(str)
+            uniques, inverse = np.unique(labels_str, return_inverse=True)
+            self.class_names = uniques.tolist()
+            self.labels = torch.tensor(inverse, dtype=torch.long)
+        else:
+            # Regression: ensure float tensor; coerce non-numeric to NaN then fill 0
+            try:
+                y = pd.to_numeric(labels_array, errors='coerce').astype(float)
+            except Exception:
+                y = np.array([float(x) if str(x).replace('.', '', 1).isdigit() else np.nan for x in labels_array], dtype=float)
+            y = np.nan_to_num(y, nan=0.0)
+            self.labels = torch.tensor(y, dtype=torch.float)
+        self.timestamps = timestamps
 
     def __len__(self):
         return len(self.entities)
@@ -91,6 +116,7 @@ class RelBenchTrainer:
         self.base_trainer = KumoRFMTrainer(
             model, config, experiment_config, device
         )
+        self.best_checkpoint_path = None
 
         # Set task configuration
         self.model.set_task_config(task_config)
@@ -101,10 +127,8 @@ class RelBenchTrainer:
     def _get_criterion(self):
         """Get loss function"""
         if self.task_config.task_type == 'classification':
-            if self.task_config.num_classes == 2:
-                return torch.nn.BCEWithLogitsLoss()
-            else:
-                return torch.nn.CrossEntropyLoss()
+            # Use CrossEntropy for all classification (binary and multi-class)
+            return torch.nn.CrossEntropyLoss()
         else:
             return torch.nn.MSELoss()
 
@@ -112,9 +136,15 @@ class RelBenchTrainer:
         """Train model"""
         logger.info("Starting training...")
 
+        # Timing trackers
+        self.epoch_times: List[float] = []
+        self.train_start_iso = datetime.now().isoformat()
+        t0_total = time.time()
+
         best_val_metric = float('inf') if self.task_config.task_type == 'regression' else 0.0
 
         for epoch in range(self.experiment_config.num_epochs):
+            t0_epoch = time.time()
             # Training phase
             train_loss = self._train_epoch(train_loader, epoch)
 
@@ -127,6 +157,11 @@ class RelBenchTrainer:
             logger.info(f"  Val Loss: {val_loss:.4f}")
             logger.info(f"  Val Metric: {val_metric:.4f}")
 
+            # Epoch timing
+            epoch_time = time.time() - t0_epoch
+            self.epoch_times.append(epoch_time)
+            logger.info(f"  Epoch Time: {epoch_time:.2f}s")
+
             # Save best model
             if self._is_better(val_metric, best_val_metric):
                 best_val_metric = val_metric
@@ -138,7 +173,10 @@ class RelBenchTrainer:
                 logger.info("Early stopping triggered, stopping training")
                 break
 
-        logger.info(f"Training completed! Best validation metric: {best_val_metric:.4f}")
+        # Total timing
+        self.total_time_sec = time.time() - t0_total
+        self.train_end_iso = datetime.now().isoformat()
+        logger.info(f"Training completed in {self.total_time_sec:.2f}s. Best validation metric: {best_val_metric:.4f}")
 
     def _train_epoch(self, train_loader: DataLoader, epoch: int) -> float:
         """Train one epoch"""
@@ -171,7 +209,7 @@ class RelBenchTrainer:
                 # Calculate loss
                 if pred is not None:
                     target = batch_data['labels'][i:i+1]
-                    if self.task_config.task_type == 'classification' and self.task_config.num_classes > 2:
+                    if self.task_config.task_type == 'classification':
                         target = target.long()
 
                     item_loss = self.criterion(pred, target)
@@ -227,7 +265,7 @@ class RelBenchTrainer:
 
                     if pred is not None:
                         target = batch_data['labels'][i:i+1]
-                        if self.task_config.task_type == 'classification' and self.task_config.num_classes > 2:
+                        if self.task_config.task_type == 'classification':
                             target = target.long()
 
                         item_loss = self.criterion(pred, target)
@@ -235,10 +273,11 @@ class RelBenchTrainer:
 
                         # Collect predictions
                         if self.task_config.task_type == 'classification':
-                            if self.task_config.num_classes == 2:
-                                pred_class = (torch.sigmoid(pred) > 0.5).float()
-                            else:
+                            # If logits vector, use argmax; if scalar logit, use sigmoid threshold
+                            if pred.dim() > 1 and pred.shape[-1] > 1:
                                 pred_class = pred.argmax(dim=-1).float()
+                            else:
+                                pred_class = (torch.sigmoid(pred) > 0.5).float()
                             all_preds.append(pred_class.item())
                         else:
                             all_preds.append(pred.item())
@@ -336,6 +375,7 @@ class RelBenchTrainer:
         }
 
         torch.save(checkpoint, checkpoint_path)
+        self.best_checkpoint_path = checkpoint_path
 
 
 def main():
@@ -345,8 +385,8 @@ def main():
     parser.add_argument('--dataset', type=str, default='amazon',
                        choices=['amazon', 'stack', 'f1', 'trial', 'avito', 'event', 'hm'],
                        help='RelBench dataset name')
-    parser.add_argument('--task', type=str, required=True,
-                       help='Task name (e.g., user-churn, item-sales)')
+    parser.add_argument('--task', type=str, default='auto', required=False,
+                       help="Task name (e.g., user-churn). Use 'auto' to infer/fallback.")
 
     # Model arguments
     parser.add_argument('--hidden-dim', type=int, default=256,
@@ -376,6 +416,8 @@ def main():
                        help='Random seed')
     parser.add_argument('--output-dir', type=str, default='./relbench_outputs',
                        help='Output directory')
+    parser.add_argument('--dry-run', action='store_true',
+                       help='Run with a tiny synthetic dataset (no RelBench needed)')
 
     args = parser.parse_args()
 
@@ -392,23 +434,94 @@ def main():
     with open(output_dir / 'config.json', 'w') as f:
         json.dump(vars(args), f, indent=2)
 
-    # Load RelBench data
-    logger.info(f"Loading RelBench dataset: {args.dataset}")
-    adapter = RelBenchAdapter(args.dataset)
-    dataset = adapter.load_dataset()
+    # Prepare in-context label table + forward sampler
+    label_table = InContextLabelTable()
+    forward_sampler = ForwardLabelSampler(label_table)
 
-    # Convert data
-    database = adapter.convert_database()
-    graph = adapter.build_temporal_graph()
+    # Optionally run a tiny synthetic pipeline to validate end-to-end
+    if args.dry_run:
+        logger.info("Dry-run enabled: using a tiny synthetic dataset")
 
-    # Get database schema
-    database_schema = get_database_schema_from_relbench(dataset)
+        # Build a tiny graph with one node type and no edges
+        from data.temporal_graph import TemporalHeterogeneousGraph
+        graph = TemporalHeterogeneousGraph()
+        num_nodes = 20
+        features = torch.randn(num_nodes, args.hidden_dim)
+        graph.add_node_type('user', num_nodes, features=features)
 
-    # Get task configuration
-    task_config = adapter.get_task_config(args.task)
+        # Minimal database schema
+        database_schema = {
+            'user': {
+                'feature': 'numerical',
+            }
+        }
 
-    # Get data splits
-    data_splits = adapter.get_train_test_split(args.task)
+        # Task: binary classification on a single entity type
+        from config.model_config import TaskConfig
+        task_config = TaskConfig(task_type='classification', num_classes=2, target_column='label')
+
+        # Create synthetic splits
+        all_entities = [('user', i) for i in range(num_nodes)]
+        all_labels = (torch.rand(num_nodes) > 0.5).float().numpy()
+        base_time = datetime.now()
+        all_times = [base_time for _ in range(num_nodes)]
+
+        idx_train = list(range(0, int(num_nodes*0.6)))
+        idx_val = list(range(int(num_nodes*0.6), int(num_nodes*0.8)))
+        idx_test = list(range(int(num_nodes*0.8), num_nodes))
+
+        def subset(indices):
+            return {
+                'entities': [all_entities[i] for i in indices],
+                'labels': [all_labels[i] for i in indices],
+                'timestamps': [all_times[i] for i in indices],
+            }
+
+        data_splits = {
+            'train': subset(idx_train),
+            'val': subset(idx_val),
+            'test': subset(idx_test),
+        }
+    else:
+        # Load RelBench data (robust to dataset variants and availability)
+        logger.info(f"Loading RelBench dataset: {args.dataset}")
+        adapter = RelBenchAdapter(args.dataset)
+
+        def try_prepare(_adapter):
+            _dataset = _adapter.load_dataset()
+            _db = _adapter.convert_database()
+            _graph = _adapter.build_temporal_graph()
+            return _dataset, _db, _graph
+
+        candidates = [args.dataset, f"rel-{args.dataset}", "trial", "rel-trial", "stack", "rel-stack", "f1", "rel-f1"]
+        dataset = None
+        for cand in candidates:
+            try:
+                name = cand.replace("rel-", "")
+                adapter = RelBenchAdapter(name)
+                dataset, database, graph = try_prepare(adapter)
+                logger.info(f"Prepared dataset '{cand}' successfully")
+                break
+            except Exception as e:
+                logger.warning(f"Dataset candidate '{cand}' failed: {e}")
+                continue
+        if dataset is None:
+            raise RuntimeError("Failed to prepare any RelBench dataset. Ensure data is available locally.")
+
+        # Get database schema
+        database_schema = get_database_schema_from_relbench(dataset)
+
+        # Get task configuration
+        task_config = adapter.get_task_config(args.task)
+
+        # Get data splits
+        data_splits = adapter.get_train_test_split(args.task)
+
+    # Populate in-context label table (train + val splits as historical contexts)
+    forward_sampler.ingest_relbench_split(data_splits['train'], metadata={'split': 'train'})
+    if 'val' in data_splits:
+        forward_sampler.ingest_relbench_split(data_splits['val'], metadata={'split': 'val'})
+    label_table.finalize()
 
     # Create datasets
     train_dataset = RelBenchDataset(
@@ -457,6 +570,22 @@ def main():
         collate_fn=collate_fn
     )
 
+    # If classification, infer number of classes from data to avoid head-size mismatches
+    if task_config.task_type == 'classification':
+        try:
+            # Collect labels from train/val/test
+            all_labels = torch.cat([
+                train_dataset.labels.view(-1),
+                val_dataset.labels.view(-1),
+                test_dataset.labels.view(-1)
+            ])
+            inferred_num_classes = int(all_labels.max().item()) + 1 if all_labels.numel() > 0 else 2
+            if not task_config.num_classes or task_config.num_classes < inferred_num_classes:
+                logger.info(f"Adjusting num_classes from {task_config.num_classes} to {inferred_num_classes}")
+                task_config.num_classes = inferred_num_classes
+        except Exception as e:
+            logger.warning(f"Could not infer number of classes from data: {e}")
+
     # Create model configuration
     model_config = KumoRFMConfig(
         hidden_dim=args.hidden_dim,
@@ -477,6 +606,8 @@ def main():
     # Create model
     logger.info("Creating KumoRFM model...")
     model = KumoRFM(model_config, database_schema).to(device)
+    if hasattr(model, 'context_sampler'):
+        model.context_sampler.attach_label_table(label_table)
 
     # Create trainer
     trainer = RelBenchTrainer(
@@ -496,7 +627,13 @@ def main():
         'config': vars(args),
         'test_results': test_results,
         'model_config': model_config.__dict__,
-        'task_config': task_config.__dict__
+        'task_config': task_config.__dict__,
+        'best_model_path': str(trainer.best_checkpoint_path) if trainer.best_checkpoint_path else None,
+        # Timing info
+        'epoch_times_sec': getattr(trainer, 'epoch_times', []),
+        'total_training_time_sec': getattr(trainer, 'total_time_sec', None),
+        'training_started_at': getattr(trainer, 'train_start_iso', None),
+        'training_finished_at': getattr(trainer, 'train_end_iso', None),
     }
 
     with open(output_dir / 'results.json', 'w') as f:
@@ -511,6 +648,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-
-from typing import Optional

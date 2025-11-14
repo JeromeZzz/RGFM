@@ -51,6 +51,8 @@ class MultiModalEncoder(nn.Module):
             metadata: 列的元数据（如词汇表大小、嵌入维度等）
         """
         encoder_key = f"{column_type}_{column_name}"
+        # Torch module names cannot contain '.'; sanitize
+        encoder_key = encoder_key.replace('.', '_')
 
         if column_type == 'numerical':
             if encoder_key not in self.encoders:

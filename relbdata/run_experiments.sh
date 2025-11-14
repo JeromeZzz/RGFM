@@ -35,7 +35,7 @@ print_warning() {
 run_amazon_churn() {
     print_info "Running Experiment: Amazon User Churn Prediction"
     
-    python relbench/train_on_relbench.py \
+    python relbdata/train_on_relbench.py \
         --dataset amazon \
         --task user-churn \
         --hidden-dim 256 \
@@ -54,7 +54,7 @@ run_amazon_churn() {
 run_stack_badge() {
     print_info "Running Experiment: Stack User Badge Prediction"
     
-    python relbench/train_on_relbench.py \
+    python relbdata/train_on_relbench.py \
         --dataset stack \
         --task user-badge \
         --hidden-dim 256 \
@@ -73,7 +73,7 @@ run_stack_badge() {
 run_f1_position() {
     print_info "Running Experiment: F1 Driver Position Prediction"
     
-    python relbench/train_on_relbench.py \
+    python relbdata/train_on_relbench.py \
         --dataset f1 \
         --task driver-position \
         --hidden-dim 256 \
@@ -100,7 +100,7 @@ run_hyperparam_search() {
             for lr in 0.0001 0.0005; do
                 print_info "Hyperparameters: hidden_dim=$hidden_dim, num_layers=$num_layers, lr=$lr"
                 
-                python relbench/train_on_relbench.py \
+                python relbdata/train_on_relbench.py \
                     --dataset $dataset \
                     --task $task \
                     --hidden-dim $hidden_dim \
@@ -122,7 +122,7 @@ run_hyperparam_search() {
 run_quick_test() {
     print_info "Running Quick Test"
     
-    python relbench/train_on_relbench.py \
+    python relbdata/train_on_relbench.py \
         --dataset amazon \
         --task user-churn \
         --hidden-dim 64 \
@@ -133,6 +133,7 @@ run_quick_test() {
         --batch-size 16 \
         --lr 0.001 \
         --device $DEVICE \
+        --dry-run \
         --output-dir $BASE_DIR/test \
         2>&1 | tee $LOG_DIR/quick_test_$(date +%Y%m%d_%H%M%S).log
 }
@@ -144,7 +145,7 @@ run_all_benchmarks() {
     # Amazon dataset
     for task in user-churn user-ltv item-churn item-ltv; do
         print_info "Running: Amazon $task"
-        python relbench/train_on_relbench.py \
+        python relbdata/train_on_relbench.py \
             --dataset amazon \
             --task $task \
             --hidden-dim 256 \
@@ -157,7 +158,7 @@ run_all_benchmarks() {
     # Stack dataset
     for task in user-badge user-engagement post-votes; do
         print_info "Running: Stack $task"
-        python relbench/train_on_relbench.py \
+        python relbdata/train_on_relbench.py \
             --dataset stack \
             --task $task \
             --hidden-dim 256 \
@@ -172,7 +173,7 @@ run_all_benchmarks() {
 analyze_results() {
     print_info "Analyzing Experiment Results"
     
-    python relbench/analyze_results.py \
+    python relbdata/analyze_results.py \
         --results-dir $BASE_DIR \
         --output-dir ./analysis \
         2>&1 | tee $LOG_DIR/analysis_$(date +%Y%m%d_%H%M%S).log

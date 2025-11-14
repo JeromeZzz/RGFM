@@ -15,6 +15,44 @@ from sampling.context_sampler import ContextSampler, ContextExample
 from .encoders.multimodal_encoder import MultiModalEncoder
 from .encoders.table_encoder import MultiTableEncoder
 from .encoders.positional_encoding import MultiElementTokenizer
+try:
+    from .relgt.relgt.encoders import (
+        NeighborNodeTypeEncoder,
+        NeighborHopEncoder,
+        NeighborTimeEncoder,
+    )
+except Exception:
+    import math
+    class NeighborNodeTypeEncoder(nn.Module):
+        def __init__(self, node_type_map, embedding_dim):
+            super().__init__()
+            num_types = (max(node_type_map.values()) + 1) if node_type_map else 1
+            self.embedding = nn.Embedding(num_types + 1, embedding_dim)
+        def forward(self, type_indices):
+            return self.embedding(type_indices)
+
+    class NeighborHopEncoder(nn.Module):
+        def __init__(self, max_neighbor_hop, embedding_dim):
+            super().__init__()
+            self.embedding = nn.Embedding(max_neighbor_hop + 2, embedding_dim)
+        def forward(self, hop_distances):
+            return self.embedding(hop_distances + 1)
+
+    class NeighborTimeEncoder(nn.Module):
+        def __init__(self, embedding_dim):
+            super().__init__()
+            self.embedding_dim = embedding_dim
+        def forward(self, rel_time):
+            # rel_time: [B, K] seconds (float)
+            device = rel_time.device
+            B, K = rel_time.shape
+            pos = rel_time.unsqueeze(-1)  # [B,K,1]
+            d = torch.arange(self.embedding_dim, device=device).float()
+            div_term = torch.exp(-(d // 2) * math.log(10000.0) / max(self.embedding_dim-1, 1))
+            sinus = torch.zeros(B, K, self.embedding_dim, device=device)
+            sinus[..., 0::2] = torch.sin(pos * div_term[0:((self.embedding_dim+1)//2)])
+            sinus[..., 1::2] = torch.cos(pos * div_term[0:(self.embedding_dim//2)])
+            return sinus
 from .relgt.relgt_model import RelGTWrapper
 from .icl.icl_module import ICLModule, ClassificationHead, RegressionHead, LinkPredictionHead
 from .icl.dual_context import DualContextMechanism
@@ -37,6 +75,7 @@ class KumoRFM(nn.Module):
         super().__init__()
         self.config = config
         self.database_schema = database_schema
+        self._context_label_vocab = {}
 
         # Initialize samplers
         sampling_config = config.__dict__.get('sampling_config', None)
@@ -79,13 +118,22 @@ class KumoRFM(nn.Module):
                     column_type
                 )
 
-        # Table encoder
+        # Table encoder (kept for backwards compatibility; features still used as base)
         table_names = list(self.database_schema.keys())
         self.table_encoder = MultiTableEncoder(self.config, table_names)
 
-        # Tokenizer
+        # Legacy tokenizer (not used for RelGT encoding now)
         num_node_types = len(self.database_schema)
         self.tokenizer = MultiElementTokenizer(self.config, num_node_types)
+
+        # RelGT five-element encoders (type/hop/time) to build token embeddings
+        # Create stable node type map
+        self.node_type_to_id = {t: i for i, t in enumerate(self.database_schema.keys())}
+        hidden = self.config.hidden_dim
+        max_hop = max(getattr(self.config, 'num_hops', 2), 2)
+        self.relgt_type_encoder = NeighborNodeTypeEncoder(self.node_type_to_id, hidden)
+        self.relgt_hop_encoder = NeighborHopEncoder(max_hop + 1, hidden)
+        self.relgt_time_encoder = NeighborTimeEncoder(hidden)
 
     def _register_task_heads(self):
         """Register task-specific prediction heads"""
@@ -129,6 +177,7 @@ class KumoRFM(nn.Module):
             Prediction results dictionary
         """
         # 1. Dynamic subgraph sampling
+        device = next(self.parameters()).device
         test_subgraph = self.backward_sampler.sample(
             graph,
             target_entity,
@@ -162,16 +211,16 @@ class KumoRFM(nn.Module):
                 ctx.entity,
                 ctx.timestamp
             )
-            context_embeddings.append(ctx_embedding)
+            context_embeddings.append(ctx_embedding.to(device))
             context_labels.append(ctx.label)
             context_entities.append(ctx.entity)
             context_timestamps.append(ctx.timestamp.timestamp())
 
         # 5. Apply dual context mechanism
         if context_embeddings:
-            context_tensor = torch.stack(context_embeddings).unsqueeze(0)
-            context_labels_tensor = self._process_labels(context_labels, task_config)
-            context_timestamps_tensor = torch.tensor(context_timestamps)
+            context_tensor = torch.stack(context_embeddings).unsqueeze(0).to(device)
+            context_labels_tensor = self._process_labels(context_labels, task_config).to(device)
+            context_timestamps_tensor = torch.tensor(context_timestamps, device=device)
 
             enhanced_test_embedding, attention_weights = self.dual_context(
                 context_tensor,
@@ -194,6 +243,7 @@ class KumoRFM(nn.Module):
             task_config.task_type,
             metadata={'task_config': task_config}
         )
+        predictions = torch.nan_to_num(predictions)
 
         # 7. Post-processing
         results = self._postprocess_predictions(predictions, task_config)
@@ -214,25 +264,37 @@ class KumoRFM(nn.Module):
         Returns:
             Final representation of target entity
         """
+        # Determine current device for model params
+        device = next(self.parameters()).device
+
         # 1. Multimodal feature encoding
         node_features_dict = {}
 
         for node_type in subgraph.node_types:
             if node_type in subgraph.node_features:
                 # Existing features
-                features = subgraph.node_features[node_type]
+                features = subgraph.node_features[node_type].to(device)
             else:
                 # Need encoding
                 # Simplified processing here, should encode from raw data in practice
                 num_nodes = subgraph.node_counts[node_type]
-                features = torch.randn(num_nodes, self.config.hidden_dim)
+                features = torch.randn(num_nodes, self.config.hidden_dim, device=device)
 
-            node_features_dict[node_type] = features
+            # Ensure feature dim matches model hidden_dim
+            node_features_dict[node_type] = self._ensure_hidden_dim(features, self.config.hidden_dim)
 
-        # 2. Intra-table encoding
-        table_embeddings = self.table_encoder(node_features_dict)
+        # 2. Intra-table encoding: reshape per-table features to 4D (B, R, C, H)
+        table_inputs = {}
+        for nt, feats in node_features_dict.items():
+            if feats.dim() == 2:
+                # (R, H) -> (1, R, 1, H)
+                table_inputs[nt] = feats.unsqueeze(0).unsqueeze(2).to(device)
+            else:
+                table_inputs[nt] = feats.to(device)
 
-        # 3. Prepare RelGT input
+        table_embeddings = self.table_encoder(table_inputs)
+
+        # 3. Prepare RelGT input (RelGT-style tokenization)
         # Merge all nodes
         all_node_features = []
         all_node_types = []
@@ -241,7 +303,12 @@ class KumoRFM(nn.Module):
 
         for i, node_type in enumerate(subgraph.node_types):
             num_nodes = subgraph.node_counts[node_type]
-            node_features = table_embeddings.get(node_type, node_features_dict[node_type])
+            te = table_embeddings.get(node_type)
+            if te is not None and te.dim() == 3:
+                # (1, R, H) -> (R, H)
+                node_features = te.squeeze(0)
+            else:
+                node_features = node_features_dict[node_type]
 
             all_node_features.append(node_features)
             all_node_types.extend([i] * num_nodes)
@@ -250,8 +317,8 @@ class KumoRFM(nn.Module):
             node_id_mapping[node_type] = (offset, offset + num_nodes)
             offset += num_nodes
 
-        all_node_features = torch.cat(all_node_features, dim=0)
-        all_node_types = torch.tensor(all_node_types)
+        all_node_features = torch.cat(all_node_features, dim=0).to(device)
+        all_node_types = torch.tensor(all_node_types, device=device)
 
         # Merge all edges
         all_edges = []
@@ -274,52 +341,83 @@ class KumoRFM(nn.Module):
                 all_edge_types.extend([edge_idx] * edge_index.shape[1])
 
         if all_edges:
-            all_edge_index = torch.cat(all_edges, dim=1)
-            all_edge_types = torch.tensor(all_edge_types)
+            all_edge_index = torch.cat(all_edges, dim=1).to(device)
+            all_edge_types = torch.tensor(all_edge_types, device=device)
         else:
-            all_edge_index = torch.zeros((2, 0), dtype=torch.long)
-            all_edge_types = torch.zeros(0, dtype=torch.long)
+            all_edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
+            all_edge_types = torch.zeros(0, dtype=torch.long, device=device)
 
-        # 4. Multi-element tokenization
+        # 4. RelGT five-element tokenization (type/hop/time + base features)
         # Get hop distance information
-        hop_distances = self._get_hop_distances(subgraph, target_entity, node_id_mapping)
+        hop_distances = self._get_hop_distances(subgraph, target_entity, node_id_mapping).to(device)
 
-        # Get time differences
-        time_diffs = self._get_time_differences(subgraph, timestamp, node_id_mapping)
+        # Get time differences (in seconds relative to prediction time)
+        time_diffs = self._get_time_differences(subgraph, timestamp, node_id_mapping).to(device)
 
-        # Tokenization
-        tokenized_features = self.tokenizer(
-            all_node_features,
-            all_node_types,
-            hop_distances,
-            time_diffs,
-            all_edge_index,
-            all_edge_types
-        )
+        # Encode structural/time components
+        type_emb = self.relgt_type_encoder(all_node_types.long()).to(device)
+        hop_emb = self.relgt_hop_encoder(hop_distances.long()).to(device)
+        # NeighborTimeEncoder expects [B, K]; feed single-batch then squeeze
+        time_emb = self.relgt_time_encoder(time_diffs.unsqueeze(0).float()).to(device).squeeze(0)
 
-        # 5. RelGT processing
-        node_embeddings = self.relgt(
-            tokenized_features,
-            all_edge_index,
-            all_node_types,
-            all_edge_types
-        )
+        # Sum components to form final token embeddings
+        tokenized_features = all_node_features + type_emb + hop_emb + time_emb
 
-        # 6. Extract target entity embedding
+        # 5. RelGT processing via local module
+        # Determine global target index in the concatenated token sequence
         target_node_type, target_node_id = target_entity
         if target_node_type in node_id_mapping:
             start, end = node_id_mapping[target_node_type]
             global_target_id = start + target_node_id
-
-            if 0 <= global_target_id < node_embeddings.shape[0]:
-                target_embedding = node_embeddings[global_target_id]
-            else:
-                # Target node not in subgraph, use zero vector
-                target_embedding = torch.zeros(self.config.hidden_dim)
         else:
-            target_embedding = torch.zeros(self.config.hidden_dim)
+            global_target_id = 0
+
+        # Reorder tokens so that the target token is first
+        if tokenized_features.dim() == 2:
+            N = tokenized_features.size(0)
+            if 0 <= global_target_id < N:
+                if global_target_id != 0:
+                    order = torch.cat([
+                        torch.tensor([global_target_id], device=tokenized_features.device),
+                        torch.arange(0, global_target_id, device=tokenized_features.device),
+                        torch.arange(global_target_id + 1, N, device=tokenized_features.device)
+                    ], dim=0)
+                    tokenized_reordered = tokenized_features[order]
+                else:
+                    tokenized_reordered = tokenized_features
+            else:
+                tokenized_reordered = tokenized_features
+        else:
+            tokenized_reordered = tokenized_features
+
+        # Ensure minimal length for stability (RelGT can be unstable for L<2)
+        if tokenized_reordered.size(0) < 2:
+            tokenized_reordered = torch.cat([tokenized_reordered, tokenized_reordered[:1]], dim=0)
+
+        target_embedding = self.relgt(
+            tokenized_reordered,
+            all_edge_index,
+            all_node_types,
+            all_edge_types
+        )
 
         return target_embedding
+
+    def _ensure_hidden_dim(self, feats: torch.Tensor, hidden_dim: int) -> torch.Tensor:
+        """Align last dimension of feats to hidden_dim without learnable params.
+        If dims differ, pad/truncate or tile to match hidden_dim.
+        feats: (N, D)
+        """
+        if feats.dim() == 1:
+            feats = feats.unsqueeze(-1)
+        N, D = feats.shape
+        if D == hidden_dim:
+            return feats
+        if D > hidden_dim:
+            return feats[:, :hidden_dim]
+        # D < hidden_dim: pad zeros
+        pad = torch.zeros(N, hidden_dim - D, device=feats.device, dtype=feats.dtype)
+        return torch.cat([feats, pad], dim=-1)
 
     def _get_hop_distances(self,
                            subgraph: TemporalHeterogeneousGraph,
@@ -327,14 +425,14 @@ class KumoRFM(nn.Module):
                            node_id_mapping: Dict[str, Tuple[int, int]]) -> torch.Tensor:
         """Get hop distances for all nodes"""
         total_nodes = sum(subgraph.node_counts.values())
-        hop_distances = torch.ones(total_nodes) * 3  # default max hops
+        hop_distances = torch.ones(total_nodes, dtype=torch.long) * 3  # default max hops
 
         # Get hop information from subgraph attributes
         for node_type in subgraph.node_types:
             if hasattr(subgraph, f'{node_type}_hop_distances'):
                 hop_tensor = getattr(subgraph, f'{node_type}_hop_distances')
                 start, end = node_id_mapping[node_type]
-                hop_distances[start:end] = hop_tensor
+                hop_distances[start:end] = hop_tensor.long()
 
         return hop_distances
 
@@ -364,13 +462,34 @@ class KumoRFM(nn.Module):
             return torch.zeros(0)
 
         if task_config.task_type == 'classification':
-            return torch.tensor(labels, dtype=torch.long).unsqueeze(0)
+            norm = self._normalize_labels(labels)
+            return torch.tensor(norm, dtype=torch.long).unsqueeze(0)
         elif task_config.task_type == 'regression':
             return torch.tensor(labels, dtype=torch.float).unsqueeze(0)
         elif task_config.task_type == 'multilabel':
             return torch.stack([torch.tensor(l, dtype=torch.float) for l in labels]).unsqueeze(0)
         else:
             return torch.tensor(labels).unsqueeze(0)
+
+    def _normalize_labels(self, labels: List[Any]) -> List[int]:
+        """Map arbitrary labels to integer indices for context processing."""
+        norm = []
+        for label in labels:
+            if isinstance(label, torch.Tensor):
+                if label.numel() == 1:
+                    label = label.item()
+                else:
+                    raise ValueError("Context label tensor must be scalar")
+            if isinstance(label, (int, float)):
+                norm.append(int(label))
+            else:
+                key = str(label)
+                if key not in self._context_label_vocab:
+                    self._context_label_vocab[key] = len(self._context_label_vocab)
+                norm.append(self._context_label_vocab[key])
+        if not norm:
+            norm = [0]
+        return norm
 
     def _postprocess_predictions(self,
                                  predictions: torch.Tensor,
@@ -383,20 +502,24 @@ class KumoRFM(nn.Module):
             probs = torch.softmax(predictions, dim=-1)
             results['probabilities'] = probs.detach().cpu().numpy()
             results['predicted_class'] = torch.argmax(probs, dim=-1).item()
+            results['predictions'] = predictions  # logits
 
         elif task_config.task_type == 'regression':
             # Regression: direct output
             results['predicted_value'] = predictions.detach().cpu().item()
+            results['predictions'] = predictions
 
         elif task_config.task_type == 'multilabel':
             # Multi-label: sigmoid to get probabilities
             probs = torch.sigmoid(predictions)
             results['probabilities'] = probs.detach().cpu().numpy()
             results['predicted_labels'] = (probs > 0.5).int().detach().cpu().numpy()
+            results['predictions'] = predictions
 
         elif task_config.task_type == 'link_prediction':
             # Link prediction: return embeddings
             results['node_embedding'] = predictions.detach().cpu().numpy()
+            results['predictions'] = predictions
 
         return results
 
@@ -408,6 +531,9 @@ class KumoRFM(nn.Module):
                 'classification',
                 ClassificationHead(self.config, task_config.num_classes)
             )
+            # Ensure new head is on the same device as the model
+            device = next(self.parameters()).device
+            self.icl_module.task_heads['classification'] = self.icl_module.task_heads['classification'].to(device)
 
         elif task_config.task_type == 'multilabel' and task_config.num_labels:
             # Can add multi-label task head
