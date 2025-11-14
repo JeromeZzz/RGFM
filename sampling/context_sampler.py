@@ -10,10 +10,12 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 import random
 from dataclasses import dataclass
+import math
 
 from data.temporal_graph import TemporalHeterogeneousGraph
 from .backward_sampler import BackwardSubgraphSampler
 from config.model_config import SamplingConfig, TaskConfig
+from .context_label_table import ContextLabelRecord, InContextLabelTable
 
 
 @dataclass
@@ -38,6 +40,11 @@ class ContextSampler:
         self.config = config
         self.backward_sampler = backward_sampler
         self.context_cache = {}  # 缓存已采样的上下文
+        self.label_table: Optional[InContextLabelTable] = None
+
+    def attach_label_table(self, table: InContextLabelTable) -> None:
+        """Attach the online in-context label table."""
+        self.label_table = table
 
     def sample_context(self,
                        graph: TemporalHeterogeneousGraph,
@@ -55,50 +62,137 @@ class ContextSampler:
             prediction_time: 预测时间
             task_config: 任务配置
             num_examples: 上下文示例数量
-            strategy: 采样策略 ('temporal', 'structural', 'mixed', 'self')
+            strategy: 采样策略 ('temporal', 'structural', 'mixed', 'self' 等)
 
         Returns:
             上下文示例列表
         """
-        context_examples = []
+        if self.label_table is not None:
+            return self._sample_from_label_table(
+                graph,
+                target_entity,
+                prediction_time,
+                task_config,
+                num_examples,
+                strategy
+            )
+
+        # 当未挂载 label table 时，退回到旧的启发式策略
+        context_examples: List[ContextExample] = []
 
         if strategy == 'temporal':
-            # 基于时间邻近度采样
             context_examples = self._sample_temporal_context(
                 graph, target_entity, prediction_time, task_config, num_examples
             )
-
         elif strategy == 'structural':
-            # 基于结构相似性采样
             context_examples = self._sample_structural_context(
                 graph, target_entity, prediction_time, task_config, num_examples
             )
-
         elif strategy == 'self':
-            # 自回归上下文（目标实体自身的历史）
             context_examples = self._sample_self_context(
                 graph, target_entity, prediction_time, task_config, num_examples
             )
-
-        elif strategy == 'mixed':
-            # 混合策略
+        else:
             num_temporal = num_examples // 3
             num_structural = num_examples // 3
             num_self = num_examples - num_temporal - num_structural
 
-            temporal_examples = self._sample_temporal_context(
-                graph, target_entity, prediction_time, task_config, num_temporal
+            context_examples = (
+                self._sample_temporal_context(
+                    graph, target_entity, prediction_time, task_config, num_temporal
+                )
+                + self._sample_structural_context(
+                    graph, target_entity, prediction_time, task_config, num_structural
+                )
+                + self._sample_self_context(
+                    graph, target_entity, prediction_time, task_config, num_self
+                )
             )
-            structural_examples = self._sample_structural_context(
-                graph, target_entity, prediction_time, task_config, num_structural
-            )
-            self_examples = self._sample_self_context(
-                graph, target_entity, prediction_time, task_config, num_self
-            )
-
-            context_examples = temporal_examples + structural_examples + self_examples
 
         return context_examples
+
+    def _sample_from_label_table(self,
+                                 graph: TemporalHeterogeneousGraph,
+                                 target_entity: Tuple[str, int],
+                                 prediction_time: datetime,
+                                 task_config: TaskConfig,
+                                 num_examples: int,
+                                 strategy: str) -> List[ContextExample]:
+        """使用上下文标签表构建上下文示例。"""
+        node_type, _ = target_entity
+        strategies = self._expand_strategy(strategy)
+        budget = max(1, math.ceil(num_examples / len(strategies)))
+        cutoff = float(prediction_time.timestamp())
+        contexts: List[ContextExample] = []
+
+        for strat in strategies:
+            records = self.label_table.sample(
+                node_type=node_type,
+                before_time=cutoff,
+                k=budget,
+                strategy=strat,
+                fixed_interval_seconds=getattr(
+                    self.config, "context_sampling_interval_seconds", 86400.0
+                ),
+            )
+            for record in records:
+                ctx = self._build_context_example(graph, record, task_config, strat)
+                if ctx:
+                    contexts.append(ctx)
+                if len(contexts) >= num_examples:
+                    break
+            if len(contexts) >= num_examples:
+                break
+
+        if not contexts:
+            # fallback to legacy temporal strategy to avoid empty contexts
+            return self._sample_temporal_context(
+                graph, target_entity, prediction_time, task_config, num_examples
+            )
+
+        return contexts
+
+    def _build_context_example(self,
+                               graph: TemporalHeterogeneousGraph,
+                               record: ContextLabelRecord,
+                               task_config: TaskConfig,
+                               strategy: str) -> Optional[ContextExample]:
+        """将标签记录转换为 ContextExample。"""
+        timestamp = datetime.fromtimestamp(record.timestamp)
+        num_hops = getattr(self.config, 'num_hops', len(self.config.max_neighbors_per_hop))
+        max_nodes = getattr(self.config, 'max_neighbors', 300)
+        try:
+            subgraph = self.backward_sampler.sample(
+                graph,
+                record.entity,
+                timestamp,
+                num_hops=num_hops,
+                max_nodes=max_nodes,
+            )
+        except Exception:
+            return None
+
+        metadata = dict(record.metadata or {})
+        metadata.setdefault('source', 'label_table')
+        metadata['strategy'] = strategy
+
+        return ContextExample(
+            subgraph=subgraph,
+            entity=record.entity,
+            timestamp=timestamp,
+            label=record.label,
+            metadata=metadata,
+        )
+
+    def _expand_strategy(self, strategy: str) -> List[str]:
+        """兼容不同策略名称并映射到新的策略集合。"""
+        if strategy in ('uniform', 'most_recent', 'fixed_interval'):
+            return [strategy]
+        if strategy == 'mixed':
+            return ['most_recent', 'uniform', 'fixed_interval']
+        if strategy in ('temporal', 'structural', 'self'):
+            return ['most_recent']
+        return ['uniform']
 
     def _sample_temporal_context(self,
                                  graph: TemporalHeterogeneousGraph,

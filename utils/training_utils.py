@@ -1,32 +1,33 @@
 """
-训练工具函数
-提供训练过程中的辅助功能
+Training utilities
+Helper functions, classes and small tools used during model training.
 """
 
+import json
+import logging
+import random
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
-import numpy as np
-from typing import Dict, List, Optional, Any, Union, Callable
-import random
-import logging
-from pathlib import Path
-import json
-from datetime import datetime
-from collections import defaultdict
-import matplotlib.pyplot as plt
-import seaborn as sns
 
 logger = logging.getLogger(__name__)
 
 
-def set_random_seed(seed: int = 42):
+def set_random_seed(seed: int = 42) -> None:
     """
-    设置随机种子以确保可重复性
+    Set random seeds to ensure reproducibility across Python, NumPy and PyTorch.
 
     Args:
-        seed: 随机种子
+        seed: Random seed value
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -35,25 +36,30 @@ def set_random_seed(seed: int = 42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    logger.info(f"随机种子设置为: {seed}")
+    logger.info(f"Random seed set to {seed}")
 
 
 class EarlyStopping:
     """
-    早停机制
+    Early-stopping helper.
+
+    Monitors a score (e.g., validation loss/metric) and stops training when
+    there is no sufficient improvement for a given patience.
     """
 
-    def __init__(self,
-                 patience: int = 10,
-                 mode: str = 'min',
-                 delta: float = 0.0001,
-                 verbose: bool = True):
+    def __init__(
+        self,
+        patience: int = 10,
+        mode: str = 'min',
+        delta: float = 0.0001,
+        verbose: bool = True,
+    ) -> None:
         """
         Args:
-            patience: 容忍的epoch数
-            mode: 'min'或'max'
-            delta: 最小改进量
-            verbose: 是否打印信息
+            patience: Number of epochs to wait without improvement
+            mode: 'min' for minimizing score, 'max' for maximizing score
+            delta: Minimum change to qualify as an improvement
+            verbose: Whether to log state changes
         """
         self.patience = patience
         self.mode = mode
@@ -61,7 +67,7 @@ class EarlyStopping:
         self.verbose = verbose
 
         self.counter = 0
-        self.best_score = None
+        self.best_score: Optional[float] = None
         self.early_stop = False
 
         if mode == 'min':
@@ -71,13 +77,13 @@ class EarlyStopping:
 
     def __call__(self, score: float) -> bool:
         """
-        检查是否应该早停
+        Update internal state with the latest score and determine early stop.
 
         Args:
-            score: 当前分数
+            score: Current validation score
 
         Returns:
-            是否早停
+            True if early stopping should be triggered, otherwise False
         """
         if self.best_score is None:
             self.best_score = score
@@ -100,8 +106,8 @@ class EarlyStopping:
 
         return False
 
-    def reset(self):
-        """重置状态"""
+    def reset(self) -> None:
+        """Reset internal counters and state."""
         self.counter = 0
         self.best_score = None
         self.early_stop = False
@@ -109,20 +115,22 @@ class EarlyStopping:
 
 class ModelCheckpoint:
     """
-    模型检查点保存器
+    Utility for saving and keeping the top-k model checkpoints based on a score.
     """
 
-    def __init__(self,
-                 save_dir: str,
-                 save_top_k: int = 3,
-                 mode: str = 'min',
-                 verbose: bool = True):
+    def __init__(
+        self,
+        save_dir: str,
+        save_top_k: int = 3,
+        mode: str = 'min',
+        verbose: bool = True,
+    ) -> None:
         """
         Args:
-            save_dir: 保存目录
-            save_top_k: 保存最好的k个模型
-            mode: 'min'或'max'
-            verbose: 是否打印信息
+            save_dir: Directory to store checkpoints
+            save_top_k: Keep at most this many best checkpoints
+            mode: 'min' (lower is better) or 'max' (higher is better)
+            verbose: Whether to log actions
         """
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -131,35 +139,37 @@ class ModelCheckpoint:
         self.mode = mode
         self.verbose = verbose
 
-        self.checkpoints = []  # [(score, path), ...]
+        # List of (score, path)
+        self.checkpoints: List[tuple] = []
 
         if mode == 'min':
             self.is_better = lambda a, b: a < b
         else:
             self.is_better = lambda a, b: a > b
 
-    def save(self,
-             model: nn.Module,
-             score: float,
-             epoch: int,
-             optimizer: Optional[Optimizer] = None,
-             metrics: Optional[Dict[str, float]] = None):
+    def save(
+        self,
+        model: nn.Module,
+        score: float,
+        epoch: int,
+        optimizer: Optional[Optimizer] = None,
+        metrics: Optional[Dict[str, float]] = None,
+    ) -> None:
         """
-        保存模型检查点
+        Save a model checkpoint.
 
         Args:
-            model: 模型
-            score: 分数
-            epoch: 轮次
-            optimizer: 优化器
-            metrics: 其他指标
+            model: Model to save
+            score: Validation score used for ranking
+            epoch: Epoch index
+            optimizer: Optional optimizer to save
+            metrics: Optional metrics to store
         """
-        # 创建检查点
-        checkpoint = {
+        checkpoint: Dict[str, Any] = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'score': score,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
         }
 
         if optimizer:
@@ -168,60 +178,54 @@ class ModelCheckpoint:
         if metrics:
             checkpoint['metrics'] = metrics
 
-        # 生成文件名
+        # Filename and save
         filename = f"checkpoint_epoch{epoch}_score{score:.4f}.pt"
         filepath = self.save_dir / filename
-
-        # 保存
         torch.save(checkpoint, filepath)
 
         if self.verbose:
-            logger.info(f"模型已保存到 {filepath}")
+            logger.info(f"Checkpoint saved to {filepath}")
 
-        # 更新检查点列表
+        # Track and maintain top-k
         self.checkpoints.append((score, filepath))
-
-        # 保持top k
         self._maintain_top_k()
 
-    def _maintain_top_k(self):
-        """维护top k个检查点"""
+    def _maintain_top_k(self) -> None:
+        """Keep only the best top-k checkpoints on disk and in memory."""
         if len(self.checkpoints) <= self.save_top_k:
             return
 
-        # 排序
+        # Sort by score
         self.checkpoints.sort(key=lambda x: x[0], reverse=(self.mode == 'max'))
 
-        # 删除多余的
+        # Delete extras from disk
         for score, path in self.checkpoints[self.save_top_k:]:
             if path.exists():
                 path.unlink()
                 if self.verbose:
-                    logger.info(f"删除检查点 {path}")
+                    logger.info(f"Deleted checkpoint {path}")
 
-        # 保留top k
+        # Keep top-k in memory
         self.checkpoints = self.checkpoints[:self.save_top_k]
 
-    def load_best(self, model: nn.Module,
-                  optimizer: Optional[Optimizer] = None) -> Dict[str, Any]:
+    def load_best(self, model: nn.Module, optimizer: Optional[Optimizer] = None) -> Dict[str, Any]:
         """
-        加载最佳模型
+        Load the best-scored checkpoint into the model (and optimizer if provided).
 
         Args:
-            model: 模型
-            optimizer: 优化器
+            model: Model instance to load state_dict into
+            optimizer: Optional optimizer to load state_dict into
 
         Returns:
-            检查点字典
+            The loaded checkpoint dict
         """
         if not self.checkpoints:
-            raise ValueError("没有可用的检查点")
+            raise ValueError("No checkpoints available")
 
-        # 找到最佳检查点
+        # Pick best checkpoint
         self.checkpoints.sort(key=lambda x: x[0], reverse=(self.mode == 'max'))
         best_score, best_path = self.checkpoints[0]
 
-        # 加载
         checkpoint = torch.load(best_path)
         model.load_state_dict(checkpoint['model_state_dict'])
 
@@ -229,62 +233,60 @@ class ModelCheckpoint:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
         if self.verbose:
-            logger.info(f"从 {best_path} 加载最佳模型，分数: {best_score}")
+            logger.info(f"Loaded best model from {best_path}, score: {best_score}")
 
         return checkpoint
 
 
 class GradientAccumulator:
     """
-    梯度累积器
-    用于模拟更大的批次
+    Gradient accumulation helper to simulate larger batch sizes.
     """
 
-    def __init__(self, accumulation_steps: int = 1):
+    def __init__(self, accumulation_steps: int = 1) -> None:
         """
         Args:
-            accumulation_steps: 累积步数
+            accumulation_steps: Number of steps to accumulate before stepping
         """
         self.accumulation_steps = accumulation_steps
         self.step_count = 0
 
     def should_step(self) -> bool:
-        """是否应该更新参数"""
+        """Return True if an optimizer step should be taken now."""
         self.step_count += 1
         return self.step_count % self.accumulation_steps == 0
 
-    def reset(self):
-        """重置计数器"""
+    def reset(self) -> None:
+        """Reset internal counter."""
         self.step_count = 0
 
 
 class MetricTracker:
     """
-    指标跟踪器
+    Simple metric tracker that averages metrics over batches and epochs.
     """
 
-    def __init__(self, metrics: List[str]):
+    def __init__(self, metrics: List[str]) -> None:
         """
         Args:
-            metrics: 要跟踪的指标名称列表
+            metrics: List of metric names to track
         """
         self.metrics = metrics
-        self.history = defaultdict(list)
-        self.current_batch = defaultdict(list)
+        self.history: Dict[str, List[float]] = defaultdict(list)
+        self.current_batch: Dict[str, List[float]] = defaultdict(list)
 
-    def update(self, predictions: torch.Tensor, targets: torch.Tensor):
+    def update(self, predictions: torch.Tensor, targets: torch.Tensor) -> None:
         """
-        更新指标
+        Update metrics for a single batch.
 
         Args:
-            predictions: 预测值
-            targets: 目标值
+            predictions: Model outputs/logits
+            targets: Ground-truth targets
         """
-        # 移到CPU
+        # Move to CPU for numpy operations
         predictions = predictions.detach().cpu()
         targets = targets.detach().cpu()
 
-        # 计算各种指标
         for metric in self.metrics:
             if metric == 'accuracy':
                 if predictions.dim() > 1:
@@ -295,13 +297,12 @@ class MetricTracker:
                 self.current_batch['accuracy'].append(correct)
 
             elif metric == 'f1':
-                # 简化的F1计算
+                # Simplified binary F1 (for quick feedback)
                 if predictions.dim() > 1:
                     pred_classes = predictions.argmax(dim=1)
                 else:
                     pred_classes = (predictions > 0.5).long()
 
-                # 二分类F1
                 tp = ((pred_classes == 1) & (targets == 1)).sum().float()
                 fp = ((pred_classes == 1) & (targets == 0)).sum().float()
                 fn = ((pred_classes == 0) & (targets == 1)).sum().float()
@@ -309,64 +310,59 @@ class MetricTracker:
                 precision = tp / (tp + fp + 1e-8)
                 recall = tp / (tp + fn + 1e-8)
                 f1 = 2 * precision * recall / (precision + recall + 1e-8)
-
                 self.current_batch['f1'].append(f1.item())
 
             elif metric == 'auc':
-                # AUC需要概率值
+                # Placeholder AUC (use sklearn.metrics.roc_auc_score for real AUC)
                 if predictions.dim() > 1 and predictions.size(1) == 2:
                     probs = torch.softmax(predictions, dim=1)[:, 1]
                 else:
                     probs = torch.sigmoid(predictions)
-
-                # 简化的AUC计算（实际应使用sklearn）
-                self.current_batch['auc'].append(0.5)  # 占位符
+                self.current_batch['auc'].append(0.5)  # placeholder value
 
             elif metric == 'mae':
-                # 平均绝对误差
                 mae = torch.abs(predictions - targets).mean().item()
                 self.current_batch['mae'].append(mae)
 
             elif metric == 'rmse':
-                # 均方根误差
                 mse = ((predictions - targets) ** 2).mean().item()
-                rmse = np.sqrt(mse)
+                rmse = float(np.sqrt(mse))
                 self.current_batch['rmse'].append(rmse)
 
     def compute(self) -> Dict[str, float]:
         """
-        计算当前批次的平均指标
+        Compute the mean value for each tracked metric in the current batch.
 
         Returns:
-            指标字典
+            A dict mapping metric names to values
         """
-        results = {}
-
+        results: Dict[str, float] = {}
         for metric in self.metrics:
             if metric in self.current_batch and self.current_batch[metric]:
-                results[metric] = np.mean(self.current_batch[metric])
-
+                results[metric] = float(np.mean(self.current_batch[metric]))
         return results
 
-    def reset(self):
-        """重置当前批次"""
+    def reset(self) -> None:
+        """Clear current batch statistics."""
         self.current_batch.clear()
 
-    def epoch_end(self):
-        """epoch结束，保存历史"""
+    def epoch_end(self) -> None:
+        """Push the current batch stats to history and reset batch stats."""
         epoch_metrics = self.compute()
         for metric, value in epoch_metrics.items():
             self.history[metric].append(value)
         self.reset()
 
-    def plot_history(self, save_path: Optional[str] = None):
-        """绘制指标历史"""
+    def plot_history(self, save_path: Optional[str] = None) -> None:
+        """Plot curves for all tracked metrics in history.
+
+        If save_path is provided, the figure will be saved to that path.
+        """
         if not self.history:
-            logger.warning("没有历史数据可绘制")
+            logger.warning("No history to plot")
             return
 
         fig, axes = plt.subplots(len(self.history), 1, figsize=(10, 4 * len(self.history)))
-
         if len(self.history) == 1:
             axes = [axes]
 
@@ -380,24 +376,22 @@ class MetricTracker:
             ax.legend()
 
         plt.tight_layout()
-
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            logger.info(f"指标图表已保存到 {save_path}")
-
+            logger.info(f"Metric plots saved to {save_path}")
         plt.close()
 
 
 def count_parameters(model: nn.Module, trainable_only: bool = False) -> int:
     """
-    计算模型参数数量
+    Count the number of parameters in a model.
 
     Args:
-        model: 模型
-        trainable_only: 是否只计算可训练参数
+        model: Model instance
+        trainable_only: If True, count only parameters with requires_grad=True
 
     Returns:
-        参数数量
+        The number of parameters
     """
     if trainable_only:
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -405,49 +399,49 @@ def count_parameters(model: nn.Module, trainable_only: bool = False) -> int:
         return sum(p.numel() for p in model.parameters())
 
 
-def save_config(config: Any, path: str):
+def save_config(config: Any, path: str) -> None:
     """
-    保存配置
+    Save a configuration object or dict to a JSON file.
 
     Args:
-        config: 配置对象
-        path: 保存路径
+        config: The configuration (object with __dict__ or a dict)
+        path: Output JSON path
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 转换为字典
+    # Convert to dict if needed
     if hasattr(config, '__dict__'):
         config_dict = config.__dict__
     else:
         config_dict = config
 
-    # 保存
     with open(path, 'w') as f:
         json.dump(config_dict, f, indent=2, default=str)
 
-    logger.info(f"配置已保存到 {path}")
+    logger.info(f"Configuration saved to {path}")
 
 
-def create_optimizer(model: nn.Module,
-                     lr: float = 1e-4,
-                     optimizer_type: str = 'adamw',
-                     weight_decay: float = 0.01,
-                     **kwargs) -> Optimizer:
+def create_optimizer(
+    model: nn.Module,
+    lr: float = 1e-4,
+    optimizer_type: str = 'adamw',
+    weight_decay: float = 0.01,
+    **kwargs,
+) -> Optimizer:
     """
-    创建优化器
+    Create an optimizer for the given model parameters.
 
     Args:
-        model: 模型
-        lr: 学习率
-        optimizer_type: 优化器类型
-        weight_decay: 权重衰减
-        **kwargs: 其他参数
+        model: Model instance
+        lr: Learning rate
+        optimizer_type: One of {'adam', 'adamw', 'sgd', 'rmsprop'}
+        weight_decay: Weight decay factor
+        **kwargs: Extra keyword arguments forwarded to the optimizer
 
     Returns:
-        优化器
+        The created optimizer instance
     """
-    # 获取参数
     params = model.parameters()
 
     if optimizer_type == 'adam':
@@ -455,38 +449,45 @@ def create_optimizer(model: nn.Module,
     elif optimizer_type == 'adamw':
         optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay, **kwargs)
     elif optimizer_type == 'sgd':
-        optimizer = torch.optim.SGD(params, lr=lr, weight_decay=weight_decay,
-                                    momentum=kwargs.get('momentum', 0.9), **kwargs)
+        optimizer = torch.optim.SGD(
+            params,
+            lr=lr,
+            weight_decay=weight_decay,
+            momentum=kwargs.get('momentum', 0.9),
+            **kwargs,
+        )
     elif optimizer_type == 'rmsprop':
         optimizer = torch.optim.RMSprop(params, lr=lr, weight_decay=weight_decay, **kwargs)
     else:
-        raise ValueError(f"不支持的优化器类型: {optimizer_type}")
+        raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
 
-    logger.info(f"创建{optimizer_type}优化器，学习率: {lr}")
-
+    logger.info(f"Created {optimizer_type} optimizer, lr={lr}")
     return optimizer
 
 
-def create_scheduler(optimizer: Optimizer,
-                     num_training_steps: int,
-                     scheduler_type: str = 'cosine',
-                     num_warmup_steps: int = 0,
-                     **kwargs) -> _LRScheduler:
+def create_scheduler(
+    optimizer: Optimizer,
+    num_training_steps: int,
+    scheduler_type: str = 'cosine',
+    num_warmup_steps: int = 0,
+    **kwargs,
+) -> _LRScheduler:
     """
-    创建学习率调度器
+    Create a learning-rate scheduler.
 
     Args:
-        optimizer: 优化器
-        num_training_steps: 总训练步数
-        scheduler_type: 调度器类型
-        num_warmup_steps: 预热步数
-        **kwargs: 其他参数
+        optimizer: Optimizer instance
+        num_training_steps: Total number of training steps
+        scheduler_type: One of {'cosine', 'linear', 'constant', 'exponential'}
+        num_warmup_steps: Warmup steps for 'linear' schedule
+        **kwargs: Extra kwargs forwarded to scheduler constructors
 
     Returns:
-        调度器
+        The created scheduler instance
     """
     if scheduler_type == 'cosine':
         from torch.optim.lr_scheduler import CosineAnnealingLR
+
         scheduler = CosineAnnealingLR(optimizer, T_max=num_training_steps, **kwargs)
 
     elif scheduler_type == 'linear':
@@ -495,22 +496,27 @@ def create_scheduler(optimizer: Optimizer,
         def lr_lambda(step):
             if step < num_warmup_steps:
                 return float(step) / float(max(1, num_warmup_steps))
-            return max(0.0, float(num_training_steps - step) /
-                       float(max(1, num_training_steps - num_warmup_steps)))
+            return max(
+                0.0,
+                float(num_training_steps - step)
+                / float(max(1, num_training_steps - num_warmup_steps)),
+            )
 
         scheduler = LambdaLR(optimizer, lr_lambda, **kwargs)
 
     elif scheduler_type == 'constant':
         from torch.optim.lr_scheduler import LambdaLR
+
         scheduler = LambdaLR(optimizer, lambda _: 1.0, **kwargs)
 
     elif scheduler_type == 'exponential':
         from torch.optim.lr_scheduler import ExponentialLR
+
         scheduler = ExponentialLR(optimizer, gamma=kwargs.get('gamma', 0.95))
 
     else:
-        raise ValueError(f"不支持的调度器类型: {scheduler_type}")
+        raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
 
-    logger.info(f"创建{scheduler_type}学习率调度器")
-
+    logger.info(f"Created {scheduler_type} learning-rate scheduler")
     return scheduler
+
