@@ -2,7 +2,6 @@
 
 RGFM（Relational Graph Foundation Model）是一个端到端的关系图基础模型框架，专门用于处理多表多列的关系数据并在时序异构图上进行训练和推理。项目集成了 RelBench 数据集、真实的 RelGT（Relational Graph Transformer）编码器以及上下文学习（ICL）预测头，能够在无需编写任务专用代码的情况下完成多种预测任务。
 
-> **说明**：原始代码基于 “Kumo” 命名，本版本已统一更名为 “RGFM”，功能保持不变。
 
 ## 核心特性
 
@@ -22,7 +21,7 @@ RGFM（Relational Graph Foundation Model）是一个端到端的关系图基础�
 4. **RelGT 编码**（`models/kumorfm.py`）  
    表级特征合并成 token，叠加节点类型/跳数/时间编码后输入真实的 RelGT LocalModule。
 5. **ICL 模块**（`models/icl/`）  
-   构建上下文序列、编码标签、通过 ICL Transformer 与任务头得到 logits / 输出。
+   构建上下文序列、编码标签、通过 图Transformer 与任务头得到 logits / 输出。
 6. **训练脚本**（`relbdata/train_on_relbench.py`）  
    统一的 CLI，支持 dry-run、自定义所有核心超参，并将模型/日志/结果写入 `relbench_outputs/`。
 
@@ -109,16 +108,6 @@ python -u relbdata/train_on_relbench.py \
 | `--output-dir` | 结果/模型输出目录 |
 | `--dry-run` | 启用小型合成数据验证链接 |
 
-常用超参数范围：
-
-| 参数 | 推荐区间 | 说明 |
-| --- | --- | --- |
-| `--hidden-dim` | 128–384 | RelGT 与 ICL 层的宽度 |
-| `--num-layers` | 2–6 | RelGT 层数 |
-| `--num-heads` | 4–8 | 注意力头数 |
-| `--dropout` | 0.1–0.5 | 正则力度，过拟合时调高 |
-| `--lr` | 1e-4 – 3e-4 | AdamW 学习率 |
-| `--batch-size` | 8–64 | 视显存而定 |
 
 ### 3）定位 CUDA 设备断言
 
@@ -164,7 +153,7 @@ RGFM/
 Relational Graph Transformer
        │
        ▼
-上下文采样生成 {(G≤t̂[ê], ŷ)}
+上下文采样生成
        │
        ▼
 上下文学习训练 (预训练)
@@ -172,7 +161,7 @@ Relational Graph Transformer
        ├──► 推理阶段 (ICL)
        │       └─ 动态预测 + 可解释输出
        │
-       └──► 微调阶段 (Fine-tuning)
+       └──► 微调阶段 (Fine-tuning)TBD
                └─ 任务特化训练 + 缓存加速
 ```
 
@@ -183,8 +172,7 @@ Relational Graph Transformer
 - **无法找到数据集**：确认 RelBench 数据已下载且路径正确，适配器会依次尝试 `trial`、`rel-trial`、`stack` 等名称。
 - **标签越界**：RGFM 会将分类标签映射为连续索引并动态扩展标签嵌入，如仍报错，可检查 `relbdata/train_on_relbench.py:569-572` 的推断逻辑。
 - **子图过小导致 RelGT 不稳定**：封装器会在序列长度小于 2 时自动复制 token 并在小批量下切换到 eval 模式。如图过于稀疏，请增大采样跳数或邻居数。
-- **仅需推理**：可使用 `inference/predictor.py` 加载已训练模型执行预测（同样以 RGFM 命名）。
+- **仅需推理**：可使用 `inference/predictor.py` 加载已训练模型执行预测。
 
 ## 许可证
 
-本项目以 MIT License 方式开源，详细内容见 [`LICENSE`](LICENSE)。
