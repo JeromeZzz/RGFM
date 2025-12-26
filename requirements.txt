@@ -21,6 +21,7 @@ seaborn>=0.12.0
 # Data processing
 pyarrow>=8.0.0
 h5py>=3.7.0
+relbench
 
 # Utilities
 python-dateutil>=2.8.0

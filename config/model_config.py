@@ -1,128 +1,82 @@
 """
-KumoRFM 模型配置
+KumoRFM Configuration Definitions
+
 """
-
-from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
-
-
-@dataclass
-class KumoRFMConfig:
-    """KumoRFM Main Configuration"""
-    # Model dimensions
-    hidden_dim: int = 256
-    num_layers: int = 4
-    num_heads: int = 8
-
-    # Sampling parameters
-    max_neighbors: int = 300  # K: local neighbor count
-    num_hops: int = 2  # k-hop neighbors
-    context_window_size: int = 10  # context example count
-
-    # RelGT parameters
-    num_global_tokens: int = 4096  # B: global centroid count
-    use_global_attention: bool = True
-
-    # Encoder parameters
-    numerical_embedding_dim: int = 64
-    categorical_embedding_dim: int = 64
-    text_embedding_dim: int = 768
-    time_embedding_dim: int = 64
-
-    # Training parameters
-    batch_size: int = 256
-    learning_rate: float = 1e-4
-    dropout_rate: float = 0.3
-    gradient_clip: float = 1.0
-
-    # ICL parameters
-    icl_num_layers: int = 2
-    icl_num_heads: int = 8
-
-    # Task related
-    task_types: List[str] = None  # ['classification', 'regression', 'link_prediction']
-
-    def __post_init__(self):
-        if self.task_types is None:
-            self.task_types = ['classification', 'regression', 'link_prediction']
-
+from dataclasses import dataclass, field
+from typing import Optional, List, Any
 
 @dataclass
 class SamplingConfig:
-    """Sampling Configuration"""
-    strategy: str = 'temporal_importance'  # 'random', 'temporal_importance', 'structure_aware'
-    max_neighbors_per_hop: List[int] = None  # max neighbors per hop
-    time_decay_factor: float = 0.9  # time decay factor
+    # Subgraph Sampling
     num_hops: int = 2
-    max_neighbors: int = 300
-    context_sampling_interval_seconds: float = 86400.0
-
-    def __post_init__(self):
-        if self.max_neighbors_per_hop is None:
-            self.max_neighbors_per_hop = [150, 100, 50]  # decreasing neighbor count
-
-
-@dataclass
-class ColumnEncoderConfig:
-    """Column Encoder Configuration"""
-    # Numerical
-    numerical_embedding_dim: int = 64
-    use_numerical_normalization: bool = True
-
-    # Categorical
-    categorical_embedding_dim: int = 64
-    max_categorical_size: int = 10000
-    unknown_token_id: int = 0
-
-    # Text
-    text_model_name: str = 'sentence-transformers/all-MiniLM-L6-v2'
-    text_max_length: int = 512
-    text_pooling: str = 'mean'  # 'mean', 'max', 'cls'
-    text_embedding_dim: int = 768
-
-    # Time
-    time_embedding_dim: int = 64
-    time_encoding_type: str = 'sinusoidal'  # 'sinusoidal', 'learned'
-
-    # Embedding
-    embedding_projection_dim: Optional[int] = None  # None means no projection
-
+    max_neighbors: int = 10
+    
+    # [Fix] Must be a List, not int. Defaulting to [10, 10] for 2-hop sampling.
+    max_neighbors_per_hop: List[int] = field(default_factory=lambda: [10, 10])
+    
+    strategy: str = 'recent'
+    
+    # BackwardSampler specifics
+    time_decay_factor: float = 0.1  
+    sample_recent_first: bool = True
+    
+    # Context Sampling
+    num_context: int = 5
+    context_strategy: str = 'mixed'
 
 @dataclass
-class TaskConfig:
-    """Task Configuration"""
-    task_type: str  # 'classification', 'regression', 'link_prediction', 'multilabel'
-    num_classes: Optional[int] = None  # number of classes for classification
-    num_labels: Optional[int] = None  # number of labels for multilabel task
-    target_column: str = None  # target column name
-    aggregation: str = 'mean'  # aggregation method
-
-    # Time window
-    time_window_start: Optional[int] = None  # start offset relative to prediction time (days)
-    time_window_end: Optional[int] = None  # end offset relative to prediction time (days)
-
-    # Link prediction specific parameters
-    negative_sampling_ratio: int = 5  # negative sampling ratio
-    link_prediction_mode: str = 'transductive'  # 'transductive', 'inductive'
-
+class KumoRFMConfig:
+    # Model Architecture
+    hidden_dim: int = 256
+    num_layers: int = 4
+    num_heads: int = 8
+    dropout_rate: float = 0.3
+    
+    # ICL Specifics
+    icl_num_layers: int = 2
+    icl_num_heads: int = 4
+    
+    # Training
+    batch_size: int = 32
+    learning_rate: float = 1e-4
+    
+    # Sampling (Nested Config)
+    sampling_config: SamplingConfig = field(default_factory=SamplingConfig)
 
 @dataclass
 class ExperimentConfig:
-    """Experiment Configuration"""
-    seed: int = 42
-    num_epochs: int = 100
+    num_epochs: int = 50
     early_stopping_patience: int = 10
-    save_dir: str = './checkpoints'
-    log_dir: str = './logs'
+    save_dir: str = './relbench_outputs'
+    log_dir: str = './relbench_outputs/logs'
+    
+    # Training fields
+    metrics: List[str] = field(default_factory=lambda: ['auc', 'rmse', 'mae'])
+    optimizer: str = 'adamw'
+    weight_decay: float = 1e-5
+    wandb_project: Optional[str] = None
+    seed: int = 42
 
-    # Data split
-    train_ratio: float = 0.7
-    val_ratio: float = 0.15
-    test_ratio: float = 0.15
+@dataclass
+class TaskConfig:
+    task_type: str  # 'classification', 'regression', 'link_prediction'
+    num_classes: int = 2
+    metric: str = 'auc' # or 'mae', 'rmse'
+    target_column: Optional[str] = None
+    
+    # Time window fields
+    time_window_start: Optional[float] = None
+    time_window_end: Optional[float] = None
 
-    # Evaluation metrics
-    metrics: List[str] = None
-
-    def __post_init__(self):
-        if self.metrics is None:
-            self.metrics = ['accuracy', 'f1', 'auc', 'mae', 'rmse']
+@dataclass
+class ColumnEncoderConfig:
+    text_model: str = 'prajjwal1/bert-tiny'
+    use_text: bool = True
+    use_image: bool = False
+    
+    # Embedding Dimensions
+    numerical_embedding_dim: int = 16
+    categorical_embedding_dim: int = 32
+    time_embedding_dim: int = 16
+    text_embedding_dim: int = 64
+    image_embedding_dim: int = 64

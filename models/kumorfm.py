@@ -1,540 +1,418 @@
 """
-KumoRFM主模型
-整合所有组件的端到端模型
-"""
+KumoRFM Main Model - High Performance Batching
 
+"""
 import torch
 import torch.nn as nn
-from typing import Dict, List, Optional, Tuple, Any
-from datetime import datetime
+from typing import Dict, Any, List
+from datetime import datetime, timezone
+import math
 
 from config.model_config import KumoRFMConfig, TaskConfig
 from data.temporal_graph import TemporalHeterogeneousGraph
-from sampling.backward_sampler import BackwardSubgraphSampler
-from sampling.context_sampler import ContextSampler, ContextExample
 from .encoders.multimodal_encoder import MultiModalEncoder
 from .encoders.table_encoder import MultiTableEncoder
 from .encoders.positional_encoding import MultiElementTokenizer
-try:
-    from .relgt.relgt.encoders import (
-        NeighborNodeTypeEncoder,
-        NeighborHopEncoder,
-        NeighborTimeEncoder,
-    )
-except Exception:
-    import math
-    class NeighborNodeTypeEncoder(nn.Module):
-        def __init__(self, node_type_map, embedding_dim):
-            super().__init__()
-            num_types = (max(node_type_map.values()) + 1) if node_type_map else 1
-            self.embedding = nn.Embedding(num_types + 1, embedding_dim)
-        def forward(self, type_indices):
-            return self.embedding(type_indices)
-
-    class NeighborHopEncoder(nn.Module):
-        def __init__(self, max_neighbor_hop, embedding_dim):
-            super().__init__()
-            self.embedding = nn.Embedding(max_neighbor_hop + 2, embedding_dim)
-        def forward(self, hop_distances):
-            return self.embedding(hop_distances + 1)
-
-    class NeighborTimeEncoder(nn.Module):
-        def __init__(self, embedding_dim):
-            super().__init__()
-            self.embedding_dim = embedding_dim
-        def forward(self, rel_time):
-            # rel_time: [B, K] seconds (float)
-            device = rel_time.device
-            B, K = rel_time.shape
-            pos = rel_time.unsqueeze(-1)  # [B,K,1]
-            d = torch.arange(self.embedding_dim, device=device).float()
-            div_term = torch.exp(-(d // 2) * math.log(10000.0) / max(self.embedding_dim-1, 1))
-            sinus = torch.zeros(B, K, self.embedding_dim, device=device)
-            sinus[..., 0::2] = torch.sin(pos * div_term[0:((self.embedding_dim+1)//2)])
-            sinus[..., 1::2] = torch.cos(pos * div_term[0:(self.embedding_dim//2)])
-            return sinus
 from .relgt.relgt_model import RelGTWrapper
 from .icl.icl_module import ICLModule, ClassificationHead, RegressionHead, LinkPredictionHead
 from .icl.dual_context import DualContextMechanism
 
+class NeighborNodeTypeEncoder(nn.Module):
+    def __init__(self, node_type_map, embedding_dim):
+        super().__init__()
+        num_types = (max(node_type_map.values()) + 1) if node_type_map else 5000
+        safe_num = max(num_types, 5000)
+        self.embedding = nn.Embedding(safe_num, embedding_dim)
+        self.num_embeddings = safe_num
+    def forward(self, x):
+        if x.max() >= self.num_embeddings: x = x.clamp(max=self.num_embeddings-1)
+        return self.embedding(x)
+
+class NeighborHopEncoder(nn.Module):
+    def __init__(self, max_hop, dim):
+        super().__init__()
+        self.embedding = nn.Embedding(max_hop + 10, dim)
+    def forward(self, x): 
+        return self.embedding((x+1).clamp(0, self.embedding.num_embeddings-1))
+
+class NeighborTimeEncoder(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+    def forward(self, rel_time):
+        device = rel_time.device
+        if rel_time.dim() == 1: rel_time = rel_time.unsqueeze(0).unsqueeze(-1)
+        elif rel_time.dim() == 2: rel_time = rel_time.unsqueeze(-1)
+        pos = rel_time
+        d = torch.arange(self.dim, device=device).float()
+        div = torch.exp(-(d//2)*math.log(10000.0)/max(self.dim-1, 1))
+        sinus = torch.zeros(pos.shape[0], pos.shape[1], self.dim, device=device)
+        sinus[..., 0::2] = torch.sin(pos * div[0::2])
+        sinus[..., 1::2] = torch.cos(pos * div[:self.dim//2])
+        return sinus
 
 class KumoRFM(nn.Module):
-    """
-    KumoRFM (Kumo Relational Foundation Model)
-    Relational Data Foundation Model
-    """
-
-    def __init__(self,
-                 config: KumoRFMConfig,
-                 database_schema: Dict[str, Dict[str, str]]):
-        """
-        Args:
-            config: Model configuration
-            database_schema: Database schema {table_name: {column_name: column_type}}
-        """
+    def __init__(self, config: KumoRFMConfig, database_schema: Dict):
         super().__init__()
         self.config = config
         self.database_schema = database_schema
-        self._context_label_vocab = {}
+        self.graph_map = {}
+        self.task_config_map = {}
+        self.id_to_node_type = {}
+        self.node_type_to_id = {}
+        
+        self.backward_sampler = None
+        self.context_sampler = None
 
-        # Initialize samplers
-        sampling_config = config.__dict__.get('sampling_config', None)
-        if sampling_config is None:
-            from config.model_config import SamplingConfig
-            sampling_config = SamplingConfig()
-
-        self.backward_sampler = BackwardSubgraphSampler(sampling_config)
-        self.context_sampler = ContextSampler(sampling_config, self.backward_sampler)
-
-        # Initialize encoders
         self._init_encoders()
-
-        # Initialize RelGT
-        num_node_types = len(database_schema)
-        self.relgt = RelGTWrapper(config, num_node_types)
-
-        # Initialize ICL module
+        self.relgt = RelGTWrapper(config, len(database_schema)+5000)
         self.icl_module = ICLModule(config)
         self.dual_context = DualContextMechanism(config)
+        self._register_heads()
+        
+        self.global_max_dim = 2 
 
-        # Register task heads
-        self._register_task_heads()
-
-        # Cache
-        self.encoding_cache = {}
+    def set_global_resources(self, graph_map, ds_map, nt_map, tc_map):
+        self.graph_map = {ds_map[k]: v for k, v in graph_map.items()}
+        self.id_to_dataset_name = {v: k for k, v in ds_map.items()}
+        self.id_to_node_type = {v: k for k, v in nt_map.items()}
+        self.node_type_to_id = nt_map
+        self.task_config_map = tc_map
+        self.relgt_type_encoder = NeighborNodeTypeEncoder(nt_map, self.config.hidden_dim)
 
     def _init_encoders(self):
-        """Initialize various encoders"""
-        # Multimodal encoder
         from config.model_config import ColumnEncoderConfig
-        column_config = ColumnEncoderConfig()
-        self.multimodal_encoder = MultiModalEncoder(column_config, self.config.hidden_dim)
+        self.multimodal_encoder = MultiModalEncoder(ColumnEncoderConfig(), self.config.hidden_dim)
+        for t, cols in self.database_schema.items():
+            for c, ctype in cols.items(): self.multimodal_encoder.register_column(f"{t}.{c}", ctype)
+        self.table_encoder = MultiTableEncoder(self.config, list(self.database_schema.keys()))
+        self.tokenizer = MultiElementTokenizer(self.config, len(self.database_schema))
+        dim = self.config.hidden_dim
+        self.relgt_type_encoder = NeighborNodeTypeEncoder({}, dim)
+        self.relgt_hop_encoder = NeighborHopEncoder(2, dim)
+        self.relgt_time_encoder = NeighborTimeEncoder(dim)
 
-        # Register all columns
-        for table_name, columns in self.database_schema.items():
-            for column_name, column_type in columns.items():
-                self.multimodal_encoder.register_column(
-                    f"{table_name}.{column_name}",
-                    column_type
-                )
+    def _register_heads(self):
+        self.icl_module.register_task_head('classification', ClassificationHead(self.config, 2))
+        self.icl_module.register_task_head('regression', RegressionHead(self.config))
+        self.icl_module.register_task_head('link_prediction', LinkPredictionHead(self.config))
 
-        # Table encoder (kept for backwards compatibility; features still used as base)
-        table_names = list(self.database_schema.keys())
-        self.table_encoder = MultiTableEncoder(self.config, table_names)
+    def set_task_config(self, config):
+        if config.task_type == 'classification' and config.num_classes:
+            self.icl_module.register_task_head('classification', ClassificationHead(self.config, config.num_classes))
+        self.global_max_dim = self._get_global_max_dim()
 
-        # Legacy tokenizer (not used for RelGT encoding now)
-        num_node_types = len(self.database_schema)
-        self.tokenizer = MultiElementTokenizer(self.config, num_node_types)
+    def _get_global_max_dim(self):
+        max_d = 1
+        for name, head in self.icl_module.task_heads.items():
+            if isinstance(head, ClassificationHead):
+                try: max_d = max(max_d, head.projection[-1].out_features)
+                except: max_d = max(max_d, 2)
+            elif isinstance(head, RegressionHead):
+                max_d = max(max_d, 1)
+        return max(max_d, 2)
 
-        # RelGT five-element encoders (type/hop/time) to build token embeddings
-        # Create stable node type map
-        self.node_type_to_id = {t: i for i, t in enumerate(self.database_schema.keys())}
-        hidden = self.config.hidden_dim
-        max_hop = max(getattr(self.config, 'num_hops', 2), 2)
-        self.relgt_type_encoder = NeighborNodeTypeEncoder(self.node_type_to_id, hidden)
-        self.relgt_hop_encoder = NeighborHopEncoder(max_hop + 1, hidden)
-        self.relgt_time_encoder = NeighborTimeEncoder(hidden)
+    def forward(self, dataset_ids, entity_type_ids, entity_ids, timestamps, task_config_ids, 
+                test_subgraphs=None, target_ents=None, ctx_exs_list=None):
+        device = dataset_ids.device
+        batch_size = len(dataset_ids)
 
-    def _register_task_heads(self):
-        """Register task-specific prediction heads"""
-        # Classification task head (default binary classification)
-        self.icl_module.register_task_head(
-            'classification',
-            ClassificationHead(self.config, num_classes=2)
-        )
+        all_ctx_subgraphs = []
+        all_ctx_targets_ent = []
+        
+        batch_target_types, batch_target_ids = [], []
+        batch_ctx_types, batch_ctx_ids = [], []
+        batch_ctx_timestamps, batch_ctx_labels = [], []
+        task_types = []
 
-        # Regression task head
-        self.icl_module.register_task_head(
-            'regression',
-            RegressionHead(self.config)
-        )
+        for i in range(batch_size):
+            nt_id = entity_type_ids[i].item()
+            node_id = entity_ids[i].item()
+            task_conf = self.task_config_map[task_config_ids[i].item()]
+            
+            task_types.append(task_conf.task_type)
+            batch_target_types.append(nt_id)
+            batch_target_ids.append(node_id)
+            
+            ctx_exs = ctx_exs_list[i]
+            c_types, c_ids, c_ts, c_lbls = [], [], [], []
+            for ctx in ctx_exs:
+                all_ctx_subgraphs.append(ctx.subgraph)
+                all_ctx_targets_ent.append(ctx.entity)
+                
+                c_nt_name, c_nid = ctx.entity
+                c_types.append(self.node_type_to_id.get(c_nt_name, 0))
+                c_ids.append(c_nid)
+                c_ts.append(ctx.timestamp.timestamp())
+                c_lbls.append(ctx.label)
+            
+            batch_ctx_types.append(c_types)
+            batch_ctx_ids.append(c_ids)
+            batch_ctx_timestamps.append(c_ts)
+            batch_ctx_labels.append(c_lbls)
 
-        # Link prediction task head
-        self.icl_module.register_task_head(
-            'link_prediction',
-            LinkPredictionHead(self.config)
-        )
+        # 2. Batched Encoding
+        test_embs = self._batch_encode_subgraphs(test_subgraphs, target_ents, timestamps, device)
+        
+        if all_ctx_subgraphs:
+            ctx_flat_embs = self._batch_encode_subgraphs(all_ctx_subgraphs, all_ctx_targets_ent, None, device)
+            if batch_size > 0:
+                real_num_ctx = len(all_ctx_subgraphs) // batch_size
+                ctx_embs = ctx_flat_embs.view(batch_size, real_num_ctx, -1)
+            else:
+                ctx_embs = torch.zeros(0, 0, self.config.hidden_dim, device=device)
+        else:
+            ctx_embs = torch.zeros(batch_size, 0, self.config.hidden_dim, device=device)
 
-    def forward(self,
-                graph: TemporalHeterogeneousGraph,
-                target_entity: Tuple[str, int],
-                prediction_time: datetime,
-                task_config: TaskConfig,
-                context_strategy: str = 'mixed',
-                num_context: int = 10) -> Dict[str, Any]:
-        """
-        Forward propagation
+        # 3. Vectorized ICL & Dual Context
+        t_types = torch.tensor(batch_target_types, device=device).view(batch_size, 1)
+        t_ids = torch.tensor(batch_target_ids, device=device).view(batch_size, 1)
+        c_types = torch.tensor(batch_ctx_types, device=device)
+        c_ids = torch.tensor(batch_ctx_ids, device=device)
+        c_ts = torch.tensor(batch_ctx_timestamps, device=device)
+        t_ts = timestamps.view(batch_size, 1)
 
-        Args:
-            graph: Temporal heterogeneous graph
-            target_entity: Target entity (node_type, node_id)
-            prediction_time: Prediction time
-            task_config: Task configuration
-            context_strategy: Context sampling strategy
-            num_context: Number of context examples
+        intra_mask = ((t_types == c_types) & (t_ids == c_ids)).float()
 
-        Returns:
-            Prediction results dictionary
-        """
-        # 1. Dynamic subgraph sampling
-        device = next(self.parameters()).device
-        test_subgraph = self.backward_sampler.sample(
-            graph,
-            target_entity,
-            prediction_time,
-            num_hops=self.config.num_hops,
-            max_nodes=self.config.max_neighbors
-        )
-
-        # 2. Context sampling
-        context_examples = self.context_sampler.sample_context(
-            graph,
-            target_entity,
-            prediction_time,
-            task_config,
-            num_examples=num_context,
-            strategy=context_strategy
-        )
-
-        # 3. Encode test subgraph
-        test_embedding = self._encode_subgraph(test_subgraph, target_entity, prediction_time)
-
-        # 4. Encode context
-        context_embeddings = []
-        context_labels = []
-        context_entities = []
-        context_timestamps = []
-
-        for ctx in context_examples:
-            ctx_embedding = self._encode_subgraph(
-                ctx.subgraph,
-                ctx.entity,
-                ctx.timestamp
+        if len(set(task_types)) == 1:
+            task_type = task_types[0]
+            label_tensor = self._batch_process_labels(batch_ctx_labels, task_type).to(device)
+            enhanced_test, _ = self.dual_context(
+                ctx_embs, label_tensor.unsqueeze(-1), test_embs.unsqueeze(1),
+                c_ts, t_ts, intra_mask
             )
-            context_embeddings.append(ctx_embedding.to(device))
-            context_labels.append(ctx.label)
-            context_entities.append(ctx.entity)
-            context_timestamps.append(ctx.timestamp.timestamp())
-
-        # 5. Apply dual context mechanism
-        if context_embeddings:
-            context_tensor = torch.stack(context_embeddings).unsqueeze(0).to(device)
-            context_labels_tensor = self._process_labels(context_labels, task_config).to(device)
-            context_timestamps_tensor = torch.tensor(context_timestamps, device=device)
-
-            enhanced_test_embedding, attention_weights = self.dual_context(
-                context_tensor,
-                context_labels_tensor,
-                context_entities,
-                test_embedding.unsqueeze(0),
-                target_entity,
-                context_timestamps_tensor,
-                prediction_time.timestamp()
-            )
-            test_embedding = enhanced_test_embedding.squeeze(0)
+            final_preds = self._run_icl_vectorized(ctx_embs, label_tensor, enhanced_test.squeeze(1), task_type)
         else:
-            attention_weights = {}
+            final_preds_list = []
+            for i in range(batch_size):
+                t_e = test_embs[i].unsqueeze(0).unsqueeze(1)
+                c_e = ctx_embs[i].unsqueeze(0)
+                l_raw = batch_ctx_labels[i]
+                l_ts = self._process_labels(l_raw, self.task_config_map[task_config_ids[i].item()]).to(device)
+                curr_intra = intra_mask[i].unsqueeze(0)
+                enh, _ = self.dual_context(c_e, l_ts, t_e, c_ts[i].unsqueeze(0), t_ts[i].unsqueeze(0), curr_intra)
+                
+                task_conf = self.task_config_map[task_config_ids[i].item()]
+                c_list = [c_e[0, k] for k in range(len(l_raw))]
+                pred = self.icl_module(c_list, l_raw, enh.squeeze(0).squeeze(0), task_conf.task_type)
+                if pred.dim() == 0: pred = pred.view(1) 
+                if pred.dim() == 1: pred = pred.view(1, -1)
+                final_preds_list.append(pred)
+            
+            final_preds = torch.cat(self._smart_pad(final_preds_list, task_types, device), dim=0)
 
-        # 6. ICL inference
-        predictions = self.icl_module(
-            context_embeddings,
-            context_labels,
-            test_embedding,
-            task_config.task_type,
-            metadata={'task_config': task_config}
-        )
-        predictions = torch.nan_to_num(predictions)
+        final_preds = self._smart_pad_tensor(final_preds, self.global_max_dim)
 
-        # 7. Post-processing
-        results = self._postprocess_predictions(predictions, task_config)
+        return {'predictions': final_preds}
 
-        # Add attention weights and other information
-        results['attention_weights'] = attention_weights
-        results['num_context_used'] = len(context_examples)
+    def _smart_pad_tensor(self, tensor, target_dim):
+        current_dim = tensor.shape[-1]
+        if current_dim < target_dim:
+            pad_size = target_dim - current_dim
+            pad = torch.zeros((tensor.shape[0], pad_size), device=tensor.device)
+            return torch.cat([tensor, pad], dim=-1)
+        return tensor
 
-        return results
+    def _batch_encode_subgraphs(self, subgraphs, target_entities, timestamps, device):
+        if not subgraphs: return torch.zeros(0, self.config.hidden_dim, device=device)
 
-    def _encode_subgraph(self,
-                         subgraph: TemporalHeterogeneousGraph,
-                         target_entity: Tuple[str, int],
-                         timestamp: datetime) -> torch.Tensor:
-        """
-        Encode subgraph
+        # [PERFORMANCE FIX] Collect everything on CPU first
+        batch_node_features = {}
+        batch_node_counts = {}
+        
+        for sub in subgraphs:
+            for nt in sub.node_types:
+                if nt not in batch_node_features:
+                    batch_node_features[nt] = []
+                    batch_node_counts[nt] = []
+                
+                # Fetch features on CPU (do not move to device yet)
+                f = sub.node_features.get(nt)
+                if f is None:
+                    # Create placeholder on CPU
+                    f = torch.zeros(sub.node_counts[nt], self.config.hidden_dim)
+                
+                # Ensure dimension on CPU
+                if f.dim() == 1: f = f.unsqueeze(-1)
+                if f.shape[-1] < self.config.hidden_dim:
+                    pad = torch.zeros(f.shape[0], self.config.hidden_dim - f.shape[-1])
+                    f = torch.cat([f, pad], dim=-1)
+                elif f.shape[-1] > self.config.hidden_dim:
+                    f = f[:, :self.config.hidden_dim]
+                    
+                batch_node_features[nt].append(f)
+                batch_node_counts[nt].append(sub.node_counts[nt])
 
-        Returns:
-            Final representation of target entity
-        """
-        # Determine current device for model params
-        device = next(self.parameters()).device
+        # Batch encode via TableEncoder
+        big_input = {}
+        for nt, feats in batch_node_features.items():
+            if feats:
+                # [PERFORMANCE FIX] Concatenate on CPU, THEN move to GPU once
+                cat_f = torch.cat(feats, dim=0).to(device)
+                big_input[nt] = cat_f.unsqueeze(0).unsqueeze(2) if cat_f.dim()==2 else cat_f
+        
+        big_enc = self.table_encoder(big_input)
 
-        # 1. Multimodal feature encoding
-        node_features_dict = {}
-
-        for node_type in subgraph.node_types:
-            if node_type in subgraph.node_features:
-                # Existing features
-                features = subgraph.node_features[node_type].to(device)
-            else:
-                # Need encoding
-                # Simplified processing here, should encode from raw data in practice
-                num_nodes = subgraph.node_counts[node_type]
-                features = torch.randn(num_nodes, self.config.hidden_dim, device=device)
-
-            # Ensure feature dim matches model hidden_dim
-            node_features_dict[node_type] = self._ensure_hidden_dim(features, self.config.hidden_dim)
-
-        # 2. Intra-table encoding: reshape per-table features to 4D (B, R, C, H)
-        table_inputs = {}
-        for nt, feats in node_features_dict.items():
-            if feats.dim() == 2:
-                # (R, H) -> (1, R, 1, H)
-                table_inputs[nt] = feats.unsqueeze(0).unsqueeze(2).to(device)
-            else:
-                table_inputs[nt] = feats.to(device)
-
-        table_embeddings = self.table_encoder(table_inputs)
-
-        # 3. Prepare RelGT input (RelGT-style tokenization)
-        # Merge all nodes
-        all_node_features = []
-        all_node_types = []
-        node_id_mapping = {}
-        offset = 0
-
-        for i, node_type in enumerate(subgraph.node_types):
-            num_nodes = subgraph.node_counts[node_type]
-            te = table_embeddings.get(node_type)
-            if te is not None and te.dim() == 3:
-                # (1, R, H) -> (R, H)
-                node_features = te.squeeze(0)
-            else:
-                node_features = node_features_dict[node_type]
-
-            all_node_features.append(node_features)
-            all_node_types.extend([i] * num_nodes)
-
-            # Record ID mapping
-            node_id_mapping[node_type] = (offset, offset + num_nodes)
-            offset += num_nodes
-
-        all_node_features = torch.cat(all_node_features, dim=0).to(device)
-        all_node_types = torch.tensor(all_node_types, device=device)
-
-        # Merge all edges
-        all_edges = []
-        all_edge_types = []
-
-        for edge_idx, edge_type in enumerate(subgraph.edge_types):
-            if edge_type in subgraph.edge_indices:
-                source_type, _, target_type = edge_type
-                edge_index = subgraph.edge_indices[edge_type]
-
-                # Convert node IDs
-                source_offset = node_id_mapping[source_type][0]
-                target_offset = node_id_mapping[target_type][0]
-
-                converted_edges = edge_index.clone()
-                converted_edges[0] += source_offset
-                converted_edges[1] += target_offset
-
-                all_edges.append(converted_edges)
-                all_edge_types.extend([edge_idx] * edge_index.shape[1])
-
-        if all_edges:
-            all_edge_index = torch.cat(all_edges, dim=1).to(device)
-            all_edge_types = torch.tensor(all_edge_types, device=device)
-        else:
-            all_edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
-            all_edge_types = torch.zeros(0, dtype=torch.long, device=device)
-
-        # 4. RelGT five-element tokenization (type/hop/time + base features)
-        # Get hop distance information
-        hop_distances = self._get_hop_distances(subgraph, target_entity, node_id_mapping).to(device)
-
-        # Get time differences (in seconds relative to prediction time)
-        time_diffs = self._get_time_differences(subgraph, timestamp, node_id_mapping).to(device)
-
-        # Encode structural/time components
-        type_emb = self.relgt_type_encoder(all_node_types.long()).to(device)
-        hop_emb = self.relgt_hop_encoder(hop_distances.long()).to(device)
-        # NeighborTimeEncoder expects [B, K]; feed single-batch then squeeze
-        time_emb = self.relgt_time_encoder(time_diffs.unsqueeze(0).float()).to(device).squeeze(0)
-
-        # Sum components to form final token embeddings
-        tokenized_features = all_node_features + type_emb + hop_emb + time_emb
-
-        # 5. RelGT processing via local module
-        # Determine global target index in the concatenated token sequence
-        target_node_type, target_node_id = target_entity
-        if target_node_type in node_id_mapping:
-            start, end = node_id_mapping[target_node_type]
-            global_target_id = start + target_node_id
-        else:
-            global_target_id = 0
-
-        # Reorder tokens so that the target token is first
-        if tokenized_features.dim() == 2:
-            N = tokenized_features.size(0)
-            if 0 <= global_target_id < N:
-                if global_target_id != 0:
-                    order = torch.cat([
-                        torch.tensor([global_target_id], device=tokenized_features.device),
-                        torch.arange(0, global_target_id, device=tokenized_features.device),
-                        torch.arange(global_target_id + 1, N, device=tokenized_features.device)
-                    ], dim=0)
-                    tokenized_reordered = tokenized_features[order]
+        # Reconstruct graph structure
+        nt_offsets = {nt: 0 for nt in big_enc.keys()}
+        giant_tokens, giant_nt, giant_ei, giant_et, tgt_indices, curr_off = [], [], [], [], [], 0
+        
+        for i, sub in enumerate(subgraphs):
+            g_f, g_t, g_map, g_c = [], [], {}, 0
+            
+            # 1. Collect Node Features (Already on GPU from big_enc)
+            for nt in sub.node_types:
+                cnt = sub.node_counts[nt]
+                if nt in big_enc:
+                    start = nt_offsets[nt]
+                    end = start + cnt
+                    g_f.append(big_enc[nt].squeeze(0)[start:end])
+                    nt_offsets[nt] = end
                 else:
-                    tokenized_reordered = tokenized_features
+                     # Fallback for missing type in batch (rare)
+                     g_f.append(torch.zeros(cnt, self.config.hidden_dim, device=device))
+
+                g_t.extend([self.node_type_to_id.get(nt,0)]*cnt)
+                g_map[nt] = (g_c, g_c+cnt)
+                g_c += cnt
+            
+            if not g_f: 
+                tgt_indices.append(curr_off)
+                giant_tokens.append(torch.zeros(1,self.config.hidden_dim,device=device))
+                giant_nt.append(torch.tensor([0],device=device))
+                curr_off+=1; continue
+            
+            tokens = torch.cat(g_f, dim=0)
+            nt_tsr = torch.tensor(g_t, device=device)
+            
+            # 2. Collect Edges
+            # [Optimization] Collect edges on CPU then move? 
+            # Subgraphs are small enough that creating tensors here is usually ok, 
+            # but let's optimize if we can. 
+            # For now, standard list comprehension is fine as edges are indices (long).
+            edges, ets = [], []
+            for idx, et in enumerate(sub.edge_types):
+                if et in sub.edge_indices:
+                    e = sub.edge_indices[et].clone() # CPU
+                    e[0] += g_map[et[0]][0]
+                    e[1] += g_map[et[2]][0]
+                    edges.append(e)
+                    ets.extend([idx]*e.shape[1])
+            
+            if edges:
+                # Concat CPU then move
+                ei = torch.cat(edges, dim=1).to(device)
+                et_tsr = torch.tensor(ets, dtype=torch.long, device=device)
             else:
-                tokenized_reordered = tokenized_features
-        else:
-            tokenized_reordered = tokenized_features
+                ei = torch.zeros((2,0), dtype=torch.long, device=device)
+                et_tsr = torch.zeros(0, dtype=torch.long, device=device)
+            
+            # 3. Time & Hop Encodings
+            ts_val = timestamps[i] if timestamps is not None else datetime.now(timezone.utc)
+            if isinstance(ts_val, torch.Tensor): ts_val = datetime.fromtimestamp(ts_val.item(), tz=timezone.utc)
 
-        # Ensure minimal length for stability (RelGT can be unstable for L<2)
-        if tokenized_reordered.size(0) < 2:
-            tokenized_reordered = torch.cat([tokenized_reordered, tokenized_reordered[:1]], dim=0)
-
-        target_embedding = self.relgt(
-            tokenized_reordered,
-            all_edge_index,
-            all_node_types,
-            all_edge_types
+            # Move auxiliary data to GPU once
+            hop = self._get_hop_distances(sub, target_entities[i], g_map).to(device)
+            time = self._get_time_differences(sub, ts_val, g_map).to(device)
+            
+            tokens = tokens + self.relgt_type_encoder(nt_tsr) + self.relgt_hop_encoder(hop) + self.relgt_time_encoder(time.unsqueeze(0).float()).squeeze(0)
+            
+            t_type, t_id = target_entities[i]
+            if t_type in g_map:
+                loc = g_map[t_type][0] + t_id
+                if 0 < loc < len(tokens):
+                    # Smart permutation to keep target first
+                    perm = torch.cat([torch.tensor([loc],device=device), torch.arange(0,loc,device=device), torch.arange(loc+1,len(tokens),device=device)])
+                    tokens = tokens[perm]
+                    nt_tsr = nt_tsr[perm]
+                    # Inverse permutation for edges
+                    inv = torch.zeros_like(perm)
+                    inv[perm] = torch.arange(len(perm), device=device)
+                    ei = inv[ei]
+            
+            giant_tokens.append(tokens)
+            giant_nt.append(nt_tsr)
+            giant_ei.append(ei + curr_off)
+            giant_et.append(et_tsr)
+            
+            tgt_indices.append(curr_off)
+            curr_off += len(tokens)
+            
+        # 4. Final RelGT Call
+        out_all = self.relgt(
+            torch.cat(giant_tokens, 0), 
+            torch.cat(giant_ei, 1), 
+            torch.cat(giant_nt, 0), 
+            torch.cat(giant_et, 0)
         )
+        return out_all[torch.tensor(tgt_indices, device=device)]
 
-        return target_embedding
+    def _run_icl_vectorized(self, ctx_embs, ctx_labels, test_emb, task_type):
+        label_emb = self.icl_module.label_encoder(ctx_labels, task_type, device=ctx_embs.device)
+        full_ctx = ctx_embs + label_emb
+        full_test = test_emb.unsqueeze(1)
+        B = ctx_embs.size(0)
+        query = self.icl_module.query_token.expand(B, -1, -1)
+        seq = torch.cat([full_ctx, full_test, query], dim=1)
+        seq_len = seq.size(1)
+        if seq_len > self.icl_module.position_encoding.size(1):
+             seq = seq[:, -self.icl_module.position_encoding.size(1):, :]
+             seq_len = seq.size(1)
+        seq = seq + self.icl_module.position_encoding[:, :seq_len, :]
+        for layer in self.icl_module.icl_layers:
+            seq = layer(seq)
+        q_out = seq[:, -1, :]
+        
+        pred = q_out
+        if task_type in self.icl_module.task_heads:
+            pred = self.icl_module.task_heads[task_type](q_out)
+        
+        if pred.dim() == 1:
+            pred = pred.view(-1, 1)
+            
+        return pred
 
-    def _ensure_hidden_dim(self, feats: torch.Tensor, hidden_dim: int) -> torch.Tensor:
-        """Align last dimension of feats to hidden_dim without learnable params.
-        If dims differ, pad/truncate or tile to match hidden_dim.
-        feats: (N, D)
-        """
-        if feats.dim() == 1:
-            feats = feats.unsqueeze(-1)
-        N, D = feats.shape
-        if D == hidden_dim:
-            return feats
-        if D > hidden_dim:
-            return feats[:, :hidden_dim]
-        # D < hidden_dim: pad zeros
-        pad = torch.zeros(N, hidden_dim - D, device=feats.device, dtype=feats.dtype)
-        return torch.cat([feats, pad], dim=-1)
+    def _smart_pad(self, preds_list, task_types, device):
+        max_dim = max(p.shape[-1] for p in preds_list)
+        out = []
+        for i, p in enumerate(preds_list):
+            if p.shape[-1] < max_dim:
+                pad_val = -1e9 if task_types[i] == 'classification' else 0.0
+                pad = torch.full((p.shape[0], max_dim - p.shape[-1]), pad_val, device=device)
+                p = torch.cat([p, pad], dim=-1)
+            out.append(p)
+        return out
 
-    def _get_hop_distances(self,
-                           subgraph: TemporalHeterogeneousGraph,
-                           target_entity: Tuple[str, int],
-                           node_id_mapping: Dict[str, Tuple[int, int]]) -> torch.Tensor:
-        """Get hop distances for all nodes"""
-        total_nodes = sum(subgraph.node_counts.values())
-        hop_distances = torch.ones(total_nodes, dtype=torch.long) * 3  # default max hops
+    def _batch_process_labels(self, labels_list, task_type):
+        flat = [item for sublist in labels_list for item in sublist]
+        dtype = torch.long if task_type == 'classification' else torch.float
+        return torch.tensor(flat, dtype=dtype).view(len(labels_list), len(labels_list[0]))
 
-        # Get hop information from subgraph attributes
-        for node_type in subgraph.node_types:
-            if hasattr(subgraph, f'{node_type}_hop_distances'):
-                hop_tensor = getattr(subgraph, f'{node_type}_hop_distances')
-                start, end = node_id_mapping[node_type]
-                hop_distances[start:end] = hop_tensor.long()
+    def _get_hop_distances(self, subgraph, target, mapping):
+        # Return on CPU, move later
+        hops = torch.full((sum(subgraph.node_counts.values()),), 3, dtype=torch.long)
+        for nt in subgraph.node_types:
+            if hasattr(subgraph, f'{nt}_hop_distances'):
+                h = getattr(subgraph, f'{nt}_hop_distances')
+                s, e = mapping[nt]
+                hops[s:e] = h
+        return hops
 
-        return hop_distances
+    def _get_time_differences(self, subgraph, ts, mapping):
+        # Return on CPU, move later
+        diffs = torch.zeros(sum(subgraph.node_counts.values()))
+        base = ts.timestamp()
+        for nt in subgraph.node_types:
+            if nt in subgraph.node_timestamps:
+                t = subgraph.node_timestamps[nt]
+                s, e = mapping[nt]
+                diffs[s:e] = base - t
+        return diffs
+    
+    def _process_labels(self, labels, config):
+        if config.task_type == 'classification':
+            return torch.tensor(self._normalize_labels(labels), dtype=torch.long).unsqueeze(0)
+        return torch.tensor(labels, dtype=torch.float).unsqueeze(0)
 
-    def _get_time_differences(self,
-                              subgraph: TemporalHeterogeneousGraph,
-                              prediction_time: datetime,
-                              node_id_mapping: Dict[str, Tuple[int, int]]) -> torch.Tensor:
-        """Calculate time differences"""
-        total_nodes = sum(subgraph.node_counts.values())
-        time_diffs = torch.zeros(total_nodes)
-
-        pred_timestamp = prediction_time.timestamp()
-
-        for node_type in subgraph.node_types:
-            if node_type in subgraph.node_timestamps:
-                timestamps = subgraph.node_timestamps[node_type]
-                start, end = node_id_mapping[node_type]
-                time_diffs[start:end] = pred_timestamp - timestamps
-
-        return time_diffs
-
-    def _process_labels(self,
-                        labels: List[Any],
-                        task_config: TaskConfig) -> torch.Tensor:
-        """Process label data"""
-        if not labels:
-            return torch.zeros(0)
-
-        if task_config.task_type == 'classification':
-            norm = self._normalize_labels(labels)
-            return torch.tensor(norm, dtype=torch.long).unsqueeze(0)
-        elif task_config.task_type == 'regression':
-            return torch.tensor(labels, dtype=torch.float).unsqueeze(0)
-        elif task_config.task_type == 'multilabel':
-            return torch.stack([torch.tensor(l, dtype=torch.float) for l in labels]).unsqueeze(0)
-        else:
-            return torch.tensor(labels).unsqueeze(0)
-
-    def _normalize_labels(self, labels: List[Any]) -> List[int]:
-        """Map arbitrary labels to integer indices for context processing."""
-        norm = []
-        for label in labels:
-            if isinstance(label, torch.Tensor):
-                if label.numel() == 1:
-                    label = label.item()
-                else:
-                    raise ValueError("Context label tensor must be scalar")
-            if isinstance(label, (int, float)):
-                norm.append(int(label))
-            else:
-                key = str(label)
-                if key not in self._context_label_vocab:
-                    self._context_label_vocab[key] = len(self._context_label_vocab)
-                norm.append(self._context_label_vocab[key])
-        if not norm:
-            norm = [0]
-        return norm
-
-    def _postprocess_predictions(self,
-                                 predictions: torch.Tensor,
-                                 task_config: TaskConfig) -> Dict[str, Any]:
-        """Post-process prediction results"""
-        results = {}
-
-        if task_config.task_type == 'classification':
-            # Classification: softmax to get probabilities
-            probs = torch.softmax(predictions, dim=-1)
-            results['probabilities'] = probs.detach().cpu().numpy()
-            results['predicted_class'] = torch.argmax(probs, dim=-1).item()
-            results['predictions'] = predictions  # logits
-
-        elif task_config.task_type == 'regression':
-            # Regression: direct output
-            results['predicted_value'] = predictions.detach().cpu().item()
-            results['predictions'] = predictions
-
-        elif task_config.task_type == 'multilabel':
-            # Multi-label: sigmoid to get probabilities
-            probs = torch.sigmoid(predictions)
-            results['probabilities'] = probs.detach().cpu().numpy()
-            results['predicted_labels'] = (probs > 0.5).int().detach().cpu().numpy()
-            results['predictions'] = predictions
-
-        elif task_config.task_type == 'link_prediction':
-            # Link prediction: return embeddings
-            results['node_embedding'] = predictions.detach().cpu().numpy()
-            results['predictions'] = predictions
-
-        return results
-
-    def set_task_config(self, task_config: TaskConfig):
-        """Update task configuration"""
-        # Update task head if needed (e.g., number of classes changed)
-        if task_config.task_type == 'classification' and task_config.num_classes:
-            self.icl_module.register_task_head(
-                'classification',
-                ClassificationHead(self.config, task_config.num_classes)
-            )
-            # Ensure new head is on the same device as the model
-            device = next(self.parameters()).device
-            self.icl_module.task_heads['classification'] = self.icl_module.task_heads['classification'].to(device)
-
-        elif task_config.task_type == 'multilabel' and task_config.num_labels:
-            # Can add multi-label task head
-            pass
+    def _normalize_labels(self, labels):
+        return [int(l) if isinstance(l, (int, float)) else 0 for l in labels]

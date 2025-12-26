@@ -1,6 +1,7 @@
 """
 RelBench Dataset Adapter
 Converts RelBench data to KumoRFM format
+(Final Version: Offline-First, Local Task Loading, Unique Edge Naming)
 """
 
 import torch
@@ -9,32 +10,35 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional, Any
 from datetime import datetime
 import logging
+import warnings
+import os
+from pathlib import Path
+
+# Suppress specific pandas warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="pandas")
+warnings.filterwarnings("ignore", category=FutureWarning, module="pandas")
 
 try:
     import relbench  # type: ignore
-    # These imports may vary by version; guard them.
     try:
         from relbench.base import Database, Table, Dataset, TaskType  # type: ignore
     except Exception:
-        Database = Table = Dataset = TaskType = object  # soft fallback types
+        Database = Table = Dataset = TaskType = object
 
     try:
-        from relbench.datasets import (
-            AmazonDataset,
-            StackDataset,
-            F1Dataset,
-            TrialDataset,
-            AvitoDataset,
-            EventDataset,
-            HMDataset,
-            get_dataset,
-        )  # type: ignore
+        from relbench.datasets import get_dataset
     except Exception:
-        # Some versions export only get_dataset
-        from relbench.datasets import get_dataset  # type: ignore
-        AmazonDataset = StackDataset = F1Dataset = TrialDataset = AvitoDataset = EventDataset = HMDataset = None  # type: ignore
+        get_dataset = None
 except ImportError:
     raise ImportError("Please install RelBench: pip install relbench")
+
+# Ensure TaskType exists for comparison
+if not hasattr(TaskType, 'BINARY_CLASSIFICATION'):
+    class MockTaskType:
+        BINARY_CLASSIFICATION = 'BINARY_CLASSIFICATION'
+        MULTICLASS_CLASSIFICATION = 'MULTICLASS_CLASSIFICATION'
+        REGRESSION = 'REGRESSION'
+    TaskType = MockTaskType
 
 from data.temporal_graph import TemporalHeterogeneousGraph
 from data.database import Database as KumoDatabase, Table as KumoTable
@@ -48,18 +52,6 @@ class RelBenchAdapter:
     Adapter from RelBench to KumoRFM
     """
 
-    # RelBench Dataset Mapping (best-effort; may be None depending on version)
-    DATASET_MAPPING = {
-        'amazon': AmazonDataset,
-        'stack': StackDataset,
-        'f1': F1Dataset,
-        'trial': TrialDataset,
-        'avito': AvitoDataset,
-        'event': EventDataset,
-        'hm': HMDataset,
-    }
-
-    # Name aliases for get_dataset
     NAME_ALIASES = {
         'amazon': ['amazon', 'rel-amazon'],
         'stack': ['stack', 'rel-stack', 'stackexchange', 'rel-stackexchange'],
@@ -71,502 +63,510 @@ class RelBenchAdapter:
     }
 
     def __init__(self, dataset_name: str):
-        """
-        Args:
-            dataset_name: RelBench dataset name
-        """
-        if dataset_name not in self.NAME_ALIASES:
-            raise ValueError(f"Unsupported dataset: {dataset_name}. "
-                             f"Supported datasets: {list(self.NAME_ALIASES.keys())}")
-
         self.dataset_name = dataset_name
         self.dataset = None
         self.database = None
         self.graph = None
-        self.tasks = {}
+        
+        # ID Mapping: table_name -> {raw_id -> tensor_index}
+        self.node_id_map = {}
 
-    def load_dataset(self) -> 'RelBenchDataset':
-        """Load RelBench dataset"""
-        logger.info(f"Loading RelBench dataset: {self.dataset_name}")
-
-        # Resolve dataset via get_dataset first, then class fallback
-        self.dataset = self._resolve_dataset_instance(self.dataset_name)
-
-        # Download data if supported
-        if self.dataset is not None and hasattr(self.dataset, 'download'):
-            try:
-                self.dataset.download()  # type: ignore
-            except Exception as e:
-                logger.warning(f"Dataset download failed or skipped: {e}")
-
-        # Best-effort dataset info across RelBench versions
-        try:
-            ds_name = getattr(self.dataset, 'name', self.dataset.__class__.__name__)
-            logger.info(f"Dataset loaded: {ds_name}")
-        except Exception:
-            pass
-        try:
-            db = self._get_db()
-            logger.info(f"  Number of tables: {len(db.table_dict)}")
-        except Exception:
-            pass
-        try:
-            tasks = getattr(self.dataset, 'tasks')
-            logger.info(f"  Number of tasks: {len(tasks)}")
-        except Exception:
-            pass
-
+    def load_dataset(self) -> Any:
+        """
+        Load dataset and force load local tasks.
+        """
+        logger.info(f"Loading RelBench dataset: {self.dataset_name} (Local/Docker Mode)")
+        
+        # 1. Load the Database object (Offline)
+        self.dataset = self._resolve_dataset(self.dataset_name)
+        
+        # 2. FORCE load local tasks from the 'tasks' folder
+        # We do this unconditionally to ensure we use the mounted files
+        self._attempt_load_local_tasks()
+            
+        if hasattr(self.dataset, 'tasks') and self.dataset.tasks:
+            logger.info(f"Loaded tasks from local storage: {list(self.dataset.tasks.keys())}")
+        else:
+            logger.warning("No local tasks found in 'tasks' folder. Please check your data mount.")
+            
         return self.dataset
 
-    # Internal helpers
-    def _resolve_dataset_instance(self, dataset_key: str):
-        """Create a RelBench dataset instance robustly across versions."""
-        # Try get_dataset with name aliases
-        try:
-            for name in self.NAME_ALIASES.get(dataset_key, [dataset_key]):
-                try:
-                    ds = get_dataset(name, download=False)  # type: ignore
-                    if ds is not None:
-                        return ds
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
-        # Fallback to class mapping if available
-        dataset_class = self.DATASET_MAPPING.get(dataset_key)
-        if dataset_class is not None:
+    def _resolve_dataset(self, key: str):
+        """
+        Resolve dataset object WITHOUT downloading.
+        """
+        candidates = self.NAME_ALIASES.get(key, [key])
+        
+        for name in candidates:
             try:
-                return dataset_class()
+                # STRICTLY download=False. We assume data is mounted.
+                ds = get_dataset(name, download=False)
+                if ds: return ds
             except Exception:
-                pass
+                continue
+        
+        # If we fail, raise a clear error for Docker/Offline usage
+        raise RuntimeError(
+            f"Could not load dataset '{key}' locally. \n"
+            f"Ensure the dataset 'db' folder is mounted at ~/.cache/relbench/{key} or ./data/{key}.\n"
+            f"Do not attempt to re-download in this environment."
+        )
 
-        raise RuntimeError(f"Failed to resolve RelBench dataset for key '{dataset_key}'. "
-                           f"Tried aliases {self.NAME_ALIASES.get(dataset_key)} and class mapping.")
+    def _attempt_load_local_tasks(self):
+        """
+        Manually scan for 'tasks' folder and load parquet files.
+        Overrides any internal RelBench task logic.
+        """
+        candidates = self.NAME_ALIASES.get(self.dataset_name, [self.dataset_name])
+        
+        # Define search paths (Docker mount points or local cache)
+        roots = [Path.home() / ".cache" / "relbench" / name for name in candidates]
+        roots.append(Path("data") / self.dataset_name) # Local fallback
+        
+        found_root = None
+        for r in roots:
+            if (r / "tasks").exists():
+                found_root = r
+                break
+        
+        if not found_root:
+            logger.warning(f"Could not find a 'tasks' directory in {roots}")
+            return
+
+        logger.info(f"Found local tasks directory at: {found_root}/tasks")
+        
+        # Initialize tasks dict if missing
+        if not hasattr(self.dataset, 'tasks') or self.dataset.tasks is None:
+            self.dataset.tasks = {}
+            
+        tasks_dir = found_root / "tasks"
+        
+        # Scan subdirectories in 'tasks' folder
+        for task_path in tasks_dir.iterdir():
+            if not task_path.is_dir(): continue
+            
+            task_name = task_path.name
+            
+            # Check for standard parquet files
+            train_f = task_path / "train.parquet"
+            val_f = task_path / "val.parquet"
+            test_f = task_path / "test.parquet"
+            
+            if train_f.exists() and val_f.exists() and test_f.exists():
+                # Only load if not already manually loaded (or overwrite to be safe)
+                try:
+                    # Inner wrapper classes to mimic RelBench objects
+                    class MockTableWrapper:
+                        def __init__(self, df, name=""): 
+                            self.df = df
+                            self.name = name
+                        
+                    class LocalTask:
+                        def __init__(self, t_path, t_name):
+                            # Load Parquet directly
+                            self.train_table = MockTableWrapper(pd.read_parquet(t_path / "train.parquet"), "train")
+                            self.val_table = MockTableWrapper(pd.read_parquet(t_path / "val.parquet"), "val")
+                            self.test_table = MockTableWrapper(pd.read_parquet(t_path / "test.parquet"), "test")
+                            
+                            # Infer Metadata from Train Table
+                            cols = self.train_table.df.columns
+                            self.timestamp_col = 'timestamp' if 'timestamp' in cols else None
+                            
+                            # Heuristic for target column
+                            if 'y' in cols: self.target_col = 'y'
+                            elif 'label' in cols: self.target_col = 'label'
+                            elif 'churn' in cols: self.target_col = 'churn'
+                            else: self.target_col = cols[-1] # Fallback
+                            
+                            # Heuristic for Task Type
+                            target_series = self.train_table.df[self.target_col]
+                            # Simple heuristic: float & many unique -> Regression, else Classification
+                            is_float = pd.api.types.is_float_dtype(target_series)
+                            nunique = target_series.nunique()
+                            
+                            if is_float and nunique > 50:
+                                self.task_type = TaskType.REGRESSION
+                                self.num_classes = None
+                            elif nunique == 2:
+                                self.task_type = TaskType.BINARY_CLASSIFICATION
+                                self.num_classes = 2
+                            else:
+                                self.task_type = TaskType.MULTICLASS_CLASSIFICATION
+                                self.num_classes = nunique
+                                
+                            self.entity_table = None # Will be inferred later
+
+                    # Register the task
+                    self.dataset.tasks[task_name] = LocalTask(task_path, task_name)
+                    logger.debug(f"  -> Registered local task: {task_name}")
+                    
+                except Exception as e:
+                    logger.warning(f"  Failed to load local task {task_name}: {e}")
 
     def _get_db(self):
-        """Return the underlying RelBench Database object from the dataset."""
         if hasattr(self.dataset, 'get_db'):
             return self.dataset.get_db()
-        if hasattr(self.dataset, 'db'):
-            return getattr(self.dataset, 'db')
-        raise RuntimeError("Dataset does not expose get_db() or .db")
+        return getattr(self.dataset, 'db', None)
 
     def convert_database(self) -> KumoDatabase:
-        """Convert RelBench database to KumoRFM database"""
-        if self.dataset is None:
-            self.load_dataset()
-
-        logger.info("Converting database format...")
-
-        # Create KumoRFM database
+        if not self.dataset: self.load_dataset()
         db = self._get_db()
         self.database = RelBenchDatabase(db)
-
         return self.database
 
     def build_temporal_graph(self) -> TemporalHeterogeneousGraph:
-        """Build temporal heterogeneous graph"""
-        if self.database is None:
-            self.convert_database()
-
+        """
+        Build graph using table-level fkey_col_to_pkey_table metadata.
+        FIXED: Uses unique edge names including column name to handle multiple FKs to same table.
+        """
+        if not self.database: self.convert_database()
+        
         logger.info("Building temporal heterogeneous graph...")
-
         self.graph = TemporalHeterogeneousGraph()
-
-        # Add node types
         db = self._get_db()
+        
+        # -------------------------------------------------------
+        # Phase 1: Build Nodes & ID Maps
+        # -------------------------------------------------------
+        self.node_id_map = {}
+        
         for table_name, table in db.table_dict.items():
             df = table.df
             num_nodes = len(df)
-
-            # Get node features
+            
+            # Map Raw ID (DataFrame Index) -> Tensor Index (0..N-1)
+            self.node_id_map[table_name] = {uid: i for i, uid in enumerate(df.index)}
+            
+            # Features
             features = self._extract_node_features(table_name, df)
-
-            # Get timestamps (if available)
+            
+            # Timestamps
             timestamps = self._extract_timestamps(table_name, df)
+            if timestamps is None:
+                timestamps = torch.zeros(num_nodes)
 
-            self.graph.add_node_type(
-                table_name,
-                num_nodes,
-                features,
-                timestamps
-            )
-
+            self.graph.add_node_type(table_name, num_nodes, features, timestamps)
             logger.debug(f"  Added node type {table_name}: {num_nodes} nodes")
 
-        # Add edges (based on foreign key relationships)
+        # -------------------------------------------------------
+        # Phase 2: Build Edges using fkey_col_to_pkey_table
+        # -------------------------------------------------------
         edge_count = 0
-        # Foreign keys may be .foreign_keys or .relationships
-        foreign_keys = []
-        db = self._get_db()
-        if hasattr(db, 'foreign_keys'):
-            foreign_keys = getattr(db, 'foreign_keys')
-        elif hasattr(db, 'relationships'):
-            foreign_keys = getattr(db, 'relationships')
+        
+        for src_table_name, src_table in db.table_dict.items():
+            # Check for foreign keys defined on this table
+            fkeys = getattr(src_table, 'fkey_col_to_pkey_table', {})
+            
+            for src_col, dst_table_name in fkeys.items():
+                if dst_table_name not in self.node_id_map:
+                    continue
+                
+                # [FIX] Unique edge name including source column to prevent collisions
+                # e.g., 'posts_parent_id_to_posts' vs 'posts_accepted_answer_id_to_posts'
+                edge_name = f"{src_table_name}_{src_col}_to_{dst_table_name}"
+                
+                src_df = src_table.df
+                
+                # Filter valid rows (FK not null)
+                valid_mask = src_df[src_col].notna()
+                if not valid_mask.any():
+                    continue
+                
+                valid_df = src_df[valid_mask]
+                
+                # 1. Get Source Tensor Indices
+                src_indices_np = np.where(valid_mask)[0]
+                
+                # 2. Get Dest Tensor Indices
+                dst_raw_ids = valid_df[src_col].values
+                dst_map = self.node_id_map[dst_table_name]
+                
+                # Map Dst Raw IDs -> Tensor Indices
+                dst_indices_series = pd.Series(dst_raw_ids).map(dst_map)
+                
+                # Filter out edges where FK points to non-existent ID
+                valid_edge_mask = dst_indices_series.notna()
+                
+                if valid_edge_mask.sum() == 0:
+                    continue
+                    
+                final_src = src_indices_np[valid_edge_mask.values]
+                final_dst = dst_indices_series[valid_edge_mask].astype(int).values
+                
+                edge_index = torch.stack([
+                    torch.from_numpy(final_src),
+                    torch.from_numpy(final_dst)
+                ], dim=0).long()
+                
+                # Edge Timestamps (inherit from source)
+                edge_ts = None
+                if src_table_name in self.graph.node_timestamps:
+                    edge_ts = self.graph.node_timestamps[src_table_name][final_src]
 
-        for fkey in foreign_keys:
-            # Support both object attributes and dicts
-            def _f(obj, name):
-                return getattr(obj, name) if hasattr(obj, name) else obj.get(name)
+                # Add Forward Edge
+                self.graph.add_edge_type(edge_name, (src_table_name, dst_table_name), edge_index, edge_ts)
+                
+                # Add Reverse Edge
+                # [FIX] Also make reverse edge name unique
+                rev_name = f"{dst_table_name}_rev_{src_table_name}_{src_col}"
+                rev_index = torch.stack([
+                    torch.from_numpy(final_dst),
+                    torch.from_numpy(final_src)
+                ], dim=0).long()
+                self.graph.add_edge_type(rev_name, (dst_table_name, src_table_name), rev_index, edge_ts)
+                
+                cnt = len(final_src)
+                edge_count += cnt * 2
+                logger.debug(f"  Added edge {edge_name}: {cnt}")
 
-            src_table_name = _f(fkey, 'src_table_name')
-            dst_table_name = _f(fkey, 'dst_table_name')
-            src_col_name = _f(fkey, 'src_col_name')
-            dst_col_name = _f(fkey, 'dst_col_name')
-
-            if src_table_name is None or dst_table_name is None:
-                continue
-
-            edge_name = f"{src_table_name}_to_{dst_table_name}"
-            src_table = db.table_dict[src_table_name]
-
-            # Build edge index
-            src_df = src_table.df
-            src_col = src_col_name
-            dst_col = dst_col_name
-
-            # Get valid edges
-            edges = []
-            for idx, row in src_df.iterrows():
-                if pd.notna(row[src_col]):
-                    src_idx = idx
-                    dst_idx = int(row[src_col])  # Assume foreign key is an integer index
-                    edges.append([src_idx, dst_idx])
-
-            if edges:
-                edge_index = torch.tensor(edges, dtype=torch.long).t()
-
-                # Add edge timestamps (if available)
-                edge_timestamps = self._extract_edge_timestamps(
-                    fkey.src_table_name, src_df, edges
-                )
-
-                self.graph.add_edge_type(
-                    edge_name,
-                    (fkey.src_table_name, fkey.dst_table_name),
-                    edge_index,
-                    edge_timestamps
-                )
-
-                edge_count += len(edges)
-                logger.debug(f"  Added edge type {edge_name}: {len(edges)} edges")
-
-        logger.info(f"Graph building complete: {self.graph.total_nodes} nodes, {edge_count} edges")
-
+        logger.info(f"Graph built: {self.graph.total_nodes} nodes, {edge_count} edges")
         return self.graph
 
     def get_task_config(self, task_name: str) -> TaskConfig:
-        """Get task configuration"""
-        if self.dataset is None:
-            self.load_dataset()
-
-        # Newer RelBench may not expose .tasks; build a default TaskConfig
+        """Infer task config from loaded tasks"""
+        if not self.dataset: self.load_dataset()
+        
         task = None
         if hasattr(self.dataset, 'tasks'):
             tasks = getattr(self.dataset, 'tasks')
-            if task_name not in tasks:
-                logger.warning(f"Task {task_name} not found in dataset.tasks; using default task config")
+            
+            # Handle 'auto' selection
+            if task_name == 'auto' and tasks:
+                task_name = list(tasks.keys())[0]
+                logger.info(f"Auto-selected task: {task_name}")
+            
+            task = tasks.get(task_name)
+            
+        # Determine Config
+        task_type = 'regression'
+        num_classes = None
+        target_col = 'label'
+        
+        if task:
+            target_col = getattr(task, 'target_col', 'label')
+            tt = getattr(task, 'task_type', 'regression')
+            
+            # Map RelBench types to string
+            if str(tt) == 'TaskType.BINARY_CLASSIFICATION' or tt == TaskType.BINARY_CLASSIFICATION:
+                task_type = 'classification'
+                num_classes = 2
+            elif str(tt) == 'TaskType.MULTICLASS_CLASSIFICATION' or tt == TaskType.MULTICLASS_CLASSIFICATION:
+                task_type = 'classification'
+                num_classes = getattr(task, 'num_classes', 2)
             else:
-                task = tasks[task_name]
-
-        if task is None:
-            # Fallback: attempt to infer from dataset attributes
-            target_col = getattr(self.dataset, 'target_col', 'label')
-            task_type = 'classification'
-            num_classes = 2
-            return TaskConfig(
-                task_type=task_type,
-                num_classes=num_classes,
-                target_column=target_col,
-                time_window_start=None,
-                time_window_end=0,
-            )
-
-        # Convert task type
-        if task.task_type == TaskType.BINARY_CLASSIFICATION:
-            task_type = 'classification'
-            num_classes = 2
-        elif task.task_type == TaskType.MULTICLASS_CLASSIFICATION:
-            task_type = 'classification'
-            num_classes = task.num_classes
-        elif task.task_type == TaskType.REGRESSION:
-            task_type = 'regression'
-            num_classes = None
-        else:
-            task_type = 'regression'  # Default
-            num_classes = None
-
-        config = TaskConfig(
+                task_type = 'regression'
+                num_classes = None
+            
+        return TaskConfig(
             task_type=task_type,
             num_classes=num_classes,
-            target_column=task.target_col,
-            time_window_start=-task.eval_timestamp_delta_days if hasattr(task, 'eval_timestamp_delta_days') else None,
+            target_column=target_col,
             time_window_end=0
         )
 
-        return config
-
     def get_train_test_split(self, task_name: str) -> Dict[str, Any]:
-        """Get train-test split"""
-        if self.dataset is None:
-            self.load_dataset()
-
+        """Get dataset splits from loaded tasks"""
+        if not self.dataset: self.load_dataset()
+        
         task = None
         if hasattr(self.dataset, 'tasks'):
-            task = getattr(self.dataset, 'tasks').get(task_name)
-        if task is None:
-            # Fallback: random split on first table as entity table
-            logger.warning("Dataset has no tasks; creating a random split on first table")
-            db = self._get_db()
-            table_name, table = next(iter(db.table_dict.items()))
-            dummy_task = type('T', (), {})()
-            dummy_task.entity_table = getattr(self.dataset, 'entity_table', table_name)
-            dummy_task.target_col = getattr(self.dataset, 'target_col', table.df.columns[-1] if len(table.df.columns) > 0 else None)
+            tasks = getattr(self.dataset, 'tasks')
+            if task_name == 'auto' and tasks:
+                task_name = list(tasks.keys())[0]
+            task = tasks.get(task_name)
+            
+        if not task:
+            logger.warning(f"Task '{task_name}' not found. Using random split.")
+            return self._create_random_split()
 
-            full = self._extract_entities_and_labels(table, dummy_task)
-            n = len(full['entities'])
-            idx = np.arange(n)
-            np.random.seed(42)
-            np.random.shuffle(idx)
-            n_train = int(0.7 * n)
-            n_val = int(0.15 * n)
-            train_idx = idx[:n_train]
-            val_idx = idx[n_train:n_train + n_val]
-            test_idx = idx[n_train + n_val:]
+        # Resolve tables
+        def get_table(prefix):
+            t = getattr(task, f"{prefix}_table", None)
+            if t: return t
+            name = getattr(task, f"{prefix}_table_name", None)
+            return self._get_db().table_dict.get(name) if name else None
 
-            def take(split_idx):
-                return {
-                    'entities': [full['entities'][i] for i in split_idx],
-                    'labels': [full['labels'][i] for i in split_idx],
-                    'timestamps': [full['timestamps'][i] for i in split_idx],
-                }
-
-            return {
-                'train': take(train_idx),
-                'val': take(val_idx),
-                'test': take(test_idx),
-            }
-
-        # Get train, validation, test tables
-        train_table = getattr(task, 'train_table', None)
-        val_table = getattr(task, 'val_table', None)
-        test_table = getattr(task, 'test_table', None)
-
-        if train_table is None or val_table is None or test_table is None:
-            # Try attributes that hold names
-            db = self._get_db()
-            def table_from_name(name):
-                return db.table_dict[name] if name in db.table_dict else None
-            train_table = train_table or table_from_name(getattr(task, 'train_table_name', ''))
-            val_table = val_table or table_from_name(getattr(task, 'val_table_name', ''))
-            test_table = test_table or table_from_name(getattr(task, 'test_table_name', ''))
-
-        # Extract entities and labels
-        result = {
-            'train': self._extract_entities_and_labels(train_table, task),
-            'val': self._extract_entities_and_labels(val_table, task),
-            'test': self._extract_entities_and_labels(test_table, task)
-        }
-
-        logger.info(f"Dataset split - {task_name}:")
-        logger.info(f"  Train set: {len(result['train']['entities'])} samples")
-        logger.info(f"  Validation set: {len(result['val']['entities'])} samples")
-        logger.info(f"  Test set: {len(result['test']['entities'])} samples")
-
-        return result
-
-    def _extract_node_features(self, table_name: str, df: pd.DataFrame) -> Optional[torch.Tensor]:
-        """Extract node features"""
-        # Select numerical columns as features (coerce potential mixed types)
-        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        if not numeric_cols:
-            # Try to coerce all columns to numeric and pick those with success
-            coerced = df.apply(lambda s: pd.to_numeric(s, errors='coerce'))
-            numeric_cols = coerced.columns[(~coerced.isna()).any()].tolist()
-            if not numeric_cols:
-                return None
-            values = coerced[numeric_cols].fillna(0.0).to_numpy(dtype=np.float32)
-        else:
-            values = df[numeric_cols].apply(lambda s: pd.to_numeric(s, errors='coerce')).fillna(0.0).to_numpy(dtype=np.float32)
-
-        return torch.from_numpy(values.astype(np.float32))
-
-    def _extract_timestamps(self, table_name: str, df: pd.DataFrame) -> Optional[torch.Tensor]:
-        """Extract timestamps"""
-        # Find time columns
-        time_cols = []
-        for col in df.columns:
-            if 'time' in col.lower() or 'date' in col.lower():
-                try:
-                    # Try converting to timestamp
-                    timestamps = pd.to_datetime(df[col]).astype(np.int64) / 1e9
-                    return torch.tensor(timestamps.values, dtype=torch.float)
-                except:
-                    continue
-
-        return None
-
-    def _extract_edge_timestamps(self, table_name: str, df: pd.DataFrame,
-                                 edges: List[List[int]]) -> Optional[torch.Tensor]:
-        """Extract edge timestamps"""
-        timestamps = self._extract_timestamps(table_name, df)
-
-        if timestamps is not None:
-            edge_times = []
-            for src_idx, _ in edges:
-                edge_times.append(timestamps[src_idx].item())
-            return torch.tensor(edge_times, dtype=torch.float)
-
-        return None
-
-    def _extract_entities_and_labels(self, table: Table, task: Any) -> Dict[str, Any]:
-        """Extract entities and labels"""
-        df = table.df
-
-        # Use row positions as node ids to match graph construction
-        node_type = getattr(task, 'entity_table', None) or getattr(table, 'name', None) or 'entity'
-        entities = [(node_type, i) for i in range(len(df))]
-
-        # Get labels
-        if hasattr(task, 'target_col') and task.target_col in df.columns:
-            labels = df[task.target_col].values
-        else:
-            labels = np.zeros(len(df))  # Placeholder
-
-        # Get timestamps
-        timestamps = []
-        time_col = task.timestamp_col if hasattr(task, 'timestamp_col') else None
-
-        if time_col and time_col in df.columns:
-            timestamps = pd.to_datetime(df[time_col]).tolist()
-        else:
-            # Use default timestamp
-            base_time = datetime.now()
-            timestamps = [base_time] * len(df)
-
+        train = get_table('train')
+        val = get_table('val')
+        test = get_table('test')
+        
+        if not train: 
+            logger.warning("Train table not found in task object. Using random split.")
+            return self._create_random_split()
+        
         return {
-            'entities': entities,
-            'labels': labels,
-            'timestamps': timestamps
+            'train': self._extract_data(train, task),
+            'val': self._extract_data(val, task),
+            'test': self._extract_data(test, task)
         }
+
+    def _create_random_split(self):
+        logger.warning("Creating random split as fallback.")
+        db = self._get_db()
+        if not db.table_dict:
+            raise RuntimeError("Database has no tables!")
+            
+        tname, table = next(iter(db.table_dict.items()))
+        
+        # Mock task
+        class MockTask:
+            entity_table = tname
+            target_col = table.df.columns[-1]
+            timestamp_col = None
+        
+        full = self._extract_data(table, MockTask())
+        n = len(full['entities'])
+        idx = np.random.permutation(n)
+        
+        def sub(i):
+            return {k: [full[k][x] for x in i] for k in full}
+            
+        return {
+            'train': sub(idx[:int(0.7*n)]),
+            'val': sub(idx[int(0.7*n):int(0.85*n)]),
+            'test': sub(idx[int(0.85*n):])
+        }
+
+    def _extract_node_features(self, table_name, df) -> torch.Tensor:
+        # Numeric only
+        num_df = df.select_dtypes(include=[np.number])
+        if num_df.empty:
+            return torch.zeros((len(df), 16)) # Fallback
+        return torch.from_numpy(num_df.fillna(0).values.astype(np.float32))
+
+    def _extract_timestamps(self, table_name, df) -> Optional[torch.Tensor]:
+        """Vectorized timestamp extraction"""
+        # Heuristic: look for 'date' or 'time' in column names
+        cols = [c for c in df.columns if 'date' in c.lower() or 'time' in c.lower()]
+        
+        for col in cols:
+            try:
+                # Fast vectorized parsing
+                if pd.__version__ >= '2.0.0':
+                    ts = pd.to_datetime(df[col], utc=True, format='mixed', errors='coerce')
+                else:
+                    ts = pd.to_datetime(df[col], utc=True, errors='coerce')
+                
+                if ts.notna().sum() == 0: continue
+                
+                ts = ts.fillna(pd.Timestamp(0, tz='UTC'))
+                # Fix FutureWarning by using astype
+                vals = ts.astype(np.int64) // 10**9
+                return torch.from_numpy(vals.values).float()
+            except:
+                continue
+        return None
+
+    def _extract_data(self, table, task) -> Dict:
+        df = table.df
+        # If the table wrapper has a name (e.g. 'train'), it's not the entity type.
+        # We need the entity table name.
+        # In RelBench task tables, usually they link to an entity table.
+        # Heuristic: Use task.entity_table if set, or guess 'user'/'item' etc.
+        
+        etype = getattr(task, 'entity_table', None)
+        if not etype:
+            # Try to guess from dataset db tables
+            # This is hard without explicit metadata. 
+            # Fallback: use 'user' or 'customer' or the first table found in DB.
+            db_tables = list(self._get_db().table_dict.keys())
+            if 'user' in db_tables: etype = 'user'
+            elif 'customer' in db_tables: etype = 'customer'
+            else: etype = db_tables[0] # Best guess
+        
+        tcol = getattr(task, 'target_col', 'label')
+        timecol = getattr(task, 'timestamp_col', None)
+        
+        # Entities extraction:
+        # Task tables usually have a column like 'customer_id' or 'user_id'
+        # We need to find that column and map it to tensor indices.
+        
+        entity_id_col = None
+        for c in df.columns:
+            if c != tcol and c != timecol and ('id' in c.lower() or c == etype):
+                entity_id_col = c
+                break
+        
+        if entity_id_col and etype in self.node_id_map:
+            # Map Entity ID -> Tensor Index
+            id_map = self.node_id_map[etype]
+            raw_ids = df[entity_id_col]
+            mapped_indices = raw_ids.map(id_map).fillna(0).astype(int).tolist()
+            entities = [(etype, i) for i in mapped_indices]
+        else:
+            # Fallback: Sequential (Warning: this might be wrong if IDs are not aligned)
+            entities = [(etype, i) for i in range(len(df))]
+        
+        # Labels
+        if tcol in df.columns:
+            labels = pd.to_numeric(df[tcol], errors='coerce').fillna(0).values
+        else:
+            labels = np.zeros(len(df))
+            
+        # Timestamps
+        timestamps = [datetime.now()] * len(df)
+        if timecol and timecol in df.columns:
+            try:
+                if pd.__version__ >= '2.0.0':
+                    ts = pd.to_datetime(df[timecol], utc=True, format='mixed', errors='coerce')
+                else:
+                    ts = pd.to_datetime(df[timecol], utc=True, errors='coerce')
+                now = pd.Timestamp.now(tz='UTC')
+                ts = ts.fillna(now)
+                timestamps = ts.tolist()
+            except:
+                pass
+                
+        return {'entities': entities, 'labels': labels, 'timestamps': timestamps}
 
 
 class RelBenchDatabase(KumoDatabase):
-    """
-    RelBench Database Wrapper
-    """
-
-    def __init__(self, relbench_db: Database):
+    def __init__(self, relbench_db):
         super().__init__()
         self.relbench_db = relbench_db
-
-        # Convert tables
-        for table_name, table in relbench_db.table_dict.items():
-            self.tables[table_name] = KumoTable(table_name, table.df)
-
-        # Convert relationships
-        if hasattr(relbench_db, 'foreign_keys'):
-            fk_iter = relbench_db.foreign_keys
-        elif hasattr(relbench_db, 'relationships'):
-            fk_iter = relbench_db.relationships
-        else:
-            fk_iter = []
-
-        for fkey in fk_iter:
-            def _f(obj, name):
-                return getattr(obj, name) if hasattr(obj, name) else obj.get(name)
-
-            self.relationships.append({
-                'source_table': _f(fkey, 'src_table_name'),
-                'source_column': _f(fkey, 'src_col_name'),
-                'target_table': _f(fkey, 'dst_table_name'),
-                'target_column': _f(fkey, 'dst_col_name'),
-                'relationship_type': 'many-to-one'  # RelBench default
-            })
+        for name, table in relbench_db.table_dict.items():
+            self.tables[name] = KumoTable(name, table.df)
+        self.relationships = [] 
 
     def load_from_source(self, source: Any) -> None:
-        """Already loaded during initialization"""
         pass
 
-    def get_table(self, table_name: str) -> KumoTable:
-        """Get table"""
-        return self.tables.get(table_name)
-
-    def get_schema(self) -> Dict[str, List[str]]:
-        """Get schema"""
-        return {name: list(table.data.columns)
-                for name, table in self.tables.items()}
-
-    def get_relationships(self) -> List[Dict[str, Any]]:
-        """Get relationships"""
-        return self.relationships
+    def get_table(self, name): return self.tables.get(name)
+    def get_schema(self): return {n: list(t.data.columns) for n,t in self.tables.items()}
+    def get_relationships(self): return []
 
 
 class RelBenchGraphConverter:
     """
     RelBench Graph Converter
-    Converts RelBench database to temporal heterogeneous graph
+    Restored class to satisfy imports in train scripts
     """
-
     def __init__(self):
         self.node_mapping = {}
         self.edge_mapping = {}
 
-    def convert(self, database: RelBenchDatabase,
-                dataset: Dataset) -> TemporalHeterogeneousGraph:
+    def convert(self, database: RelBenchDatabase, dataset: Dataset) -> TemporalHeterogeneousGraph:
         """
         Convert database to graph
-
-        This method is already implemented in RelBenchAdapter.build_temporal_graph
-        A simplified interface is provided here
+        Delegates to RelBenchAdapter's robust logic
         """
         adapter = RelBenchAdapter(dataset.name)
         adapter.dataset = dataset
         adapter.database = database
-
         return adapter.build_temporal_graph()
 
 
-def get_database_schema_from_relbench(dataset: Dataset) -> Dict[str, Dict[str, str]]:
-    """
-    Infer database schema from RelBench dataset
-    """
+def get_database_schema_from_relbench(dataset) -> Dict:
     schema = {}
-
-    # Support dataset.get_db() or .db
     db = dataset.get_db() if hasattr(dataset, 'get_db') else getattr(dataset, 'db', None)
-    if db is None:
-        return {}
-
-    for table_name, table in db.table_dict.items():
-        df = table.df
-        column_types = {}
-
-        for col in df.columns:
-            dtype = df[col].dtype
-
-            # Infer column type
-            if pd.api.types.is_numeric_dtype(dtype):
-                if df[col].nunique() < 100:
-                    column_types[col] = 'categorical'
-                else:
-                    column_types[col] = 'numerical'
-            elif pd.api.types.is_datetime64_any_dtype(dtype):
-                column_types[col] = 'time'
-            elif pd.api.types.is_string_dtype(dtype) or dtype == object:
-                if df[col].nunique() < 1000:
-                    column_types[col] = 'categorical'
-                else:
-                    column_types[col] = 'text'
-            else:
-                column_types[col] = 'categorical'
-
-        schema[table_name] = column_types
-
+    if not db: return {}
+    
+    for name, table in db.table_dict.items():
+        types = {}
+        for c in table.df.columns:
+            dt = table.df[c].dtype
+            if pd.api.types.is_numeric_dtype(dt): types[c] = 'numerical'
+            elif pd.api.types.is_datetime64_any_dtype(dt): types[c] = 'time'
+            else: types[c] = 'categorical'
+        schema[name] = types
     return schema
-
-    # --- Helpers ---
-
-    
-    

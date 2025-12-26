@@ -1,650 +1,486 @@
 """
 Train KumoRFM on RelBench datasets
+
 """
 
 import argparse
 import logging
 import torch
+import torch.nn as nn
+import torch.multiprocessing as mp
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
-import json
-import time
-from typing import Dict, Any, List, Tuple, Optional
-from torch.utils.data import Dataset, DataLoader
-
-# Ensure project root is importable when running this file directly
 import sys
+import os
+import gc
+import warnings
+from typing import Dict, Any, List
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
+
+# [Critical] Use file_system strategy for shared memory handling
+import torch.multiprocessing
+try:
+    torch.multiprocessing.set_sharing_strategy('file_system')
+except RuntimeError:
+    pass
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 from pathlib import Path as _PathForSys
 _HERE = _PathForSys(__file__).resolve()
 _ROOT = _HERE.parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from config.model_config import KumoRFMConfig, ExperimentConfig
+from config.model_config import KumoRFMConfig, ExperimentConfig, TaskConfig, SamplingConfig
 from models.kumorfm import KumoRFM
 from training.trainer import KumoRFMTrainer
 from utils.training_utils import set_random_seed
-from relbdata.adapter import (
-    RelBenchAdapter,
-    get_database_schema_from_relbench
-)
+from relbdata.adapter import RelBenchAdapter, get_database_schema_from_relbench
 from sampling.context_label_table import InContextLabelTable, ForwardLabelSampler
+from sampling.backward_sampler import BackwardSubgraphSampler
+from sampling.context_sampler import ContextSampler
+from data.temporal_graph import TemporalHeterogeneousGraph
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
+# --- Global Registries ---
+TASK_CONFIG_REGISTRY: List[TaskConfig] = []
+DATASET_NAME_REGISTRY: List[str] = []
+NODE_TYPE_REGISTRY: List[str] = []
+
+def get_registry_id(registry: List, item: Any) -> int:
+    try:
+        return registry.index(item)
+    except ValueError:
+        registry.append(item)
+        return len(registry) - 1
+
+def make_graph_shared(graph: TemporalHeterogeneousGraph):
+    """
+    Recursively move all tensors in the graph to shared memory.
+    This allows workers to access the graph without pickling/copying data.
+    """
+    # 1. Node Features
+    for nt in graph.node_features:
+        if graph.node_features[nt] is not None:
+            graph.node_features[nt].share_memory_()
+            
+    # 2. Node Timestamps
+    for nt in graph.node_timestamps:
+        if graph.node_timestamps[nt] is not None:
+            graph.node_timestamps[nt].share_memory_()
+            
+    # 3. Edge Indices and Timestamps
+    for et in graph.edge_indices:
+        graph.edge_indices[et].share_memory_()
+        if et in graph.edge_timestamps and graph.edge_timestamps[et] is not None:
+            graph.edge_timestamps[et].share_memory_()
+            
+    return graph
 
 class RelBenchDataset(Dataset):
-    """
-    PyTorch Dataset wrapper for RelBench datasets
-    """
-
-    def __init__(self,
-                 graph: 'TemporalHeterogeneousGraph',
-                 entities: List[Tuple[str, int]],
-                 labels: np.ndarray,
-                 timestamps: List[datetime],
-                 task_config: 'TaskConfig'):
-        self.graph = graph
+    def __init__(self, entities, labels, timestamps, task_config, dataset_name, 
+                 graph: TemporalHeterogeneousGraph,  # [Optimization] Accept Object (Shared Mem)
+                 backward_sampler: BackwardSubgraphSampler,
+                 context_sampler: ContextSampler,
+                 node_type_registry: List[str], 
+                 num_hops=2, max_neighbors=10, num_context=5, context_strategy='mixed'):
+        
         self.entities = entities
-        # Normalize labels based on task type
+        self.timestamps = timestamps
         self.task_config = task_config
+        self.dataset_name = dataset_name
+        
+        # Graph is now a shared-memory object.
+        # It is NOT copied when passed to workers, only the structure is pickled.
+        self.graph = graph 
+        
+        self.backward_sampler = backward_sampler
+        self.context_sampler = context_sampler
+        self.num_hops = num_hops
+        self.max_neighbors = max_neighbors
+        self.num_context = num_context
+        self.context_strategy = context_strategy
+        
+        self.node_type_registry = node_type_registry
+        self.ds_id = get_registry_id(DATASET_NAME_REGISTRY, dataset_name)
+        self.task_id = get_registry_id(TASK_CONFIG_REGISTRY, task_config)
+        
+        self.ent_type_ids = []
+        self.ent_node_ids = []
+        
+        for et, eid in entities:
+            if et not in NODE_TYPE_REGISTRY: NODE_TYPE_REGISTRY.append(et)
+            self.ent_type_ids.append(NODE_TYPE_REGISTRY.index(et))
+            self.ent_node_ids.append(eid)
+            
         labels_array = np.asarray(labels)
         if task_config.task_type == 'classification':
-            # Always remap labels to contiguous indices [0..K-1]
             labels_str = labels_array.astype(str)
-            uniques, inverse = np.unique(labels_str, return_inverse=True)
-            self.class_names = uniques.tolist()
+            _, inverse = np.unique(labels_str, return_inverse=True)
             self.labels = torch.tensor(inverse, dtype=torch.long)
         else:
-            # Regression: ensure float tensor; coerce non-numeric to NaN then fill 0
-            try:
-                y = pd.to_numeric(labels_array, errors='coerce').astype(float)
-            except Exception:
-                y = np.array([float(x) if str(x).replace('.', '', 1).isdigit() else np.nan for x in labels_array], dtype=float)
-            y = np.nan_to_num(y, nan=0.0)
-            self.labels = torch.tensor(y, dtype=torch.float)
-        self.timestamps = timestamps
+            raw_y = pd.to_numeric(pd.Series(labels_array.reshape(-1)), errors='coerce').fillna(0.0).values
+            raw_y = torch.tensor(raw_y, dtype=torch.float)
+            self.labels = torch.log1p(torch.abs(raw_y))
 
     def __len__(self):
         return len(self.entities)
 
     def __getitem__(self, idx):
+        nt_id = self.ent_type_ids[idx]
+        node_id = self.ent_node_ids[idx]
+        ts_float = self.timestamps[idx].timestamp()
+        node_type = self.node_type_registry[nt_id]
+        
+        target_ent = (node_type, node_id)
+        ts = self.timestamps[idx]
+        
+        # Sampling directly from Shared Memory (Fast RAM Access)
+        test_subgraph = self.backward_sampler.sample(
+            self.graph, target_ent, ts, self.num_hops, self.max_neighbors
+        )
+        
+        ctx_exs = self.context_sampler.sample_context(
+            self.graph, target_ent, ts, self.task_config, 
+            self.num_context, strategy=self.context_strategy
+        )
+        
         return {
-            'entity': self.entities[idx],
+            'ds_id': self.ds_id,
+            'nt_id': nt_id,
+            'node_id': node_id,
+            'ts': ts_float,
+            'task_id': self.task_id,
             'label': self.labels[idx],
-            'timestamp': self.timestamps[idx]
+            'test_subgraph': test_subgraph,
+            'target_ent': target_ent,
+            'ctx_exs': ctx_exs
         }
 
-
-def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
-    """Batch processing function"""
+def collate_fn(batch):
     return {
-        'entities': [item['entity'] for item in batch],
-        'labels': torch.stack([item['label'] for item in batch]),
-        'timestamps': [item['timestamp'] for item in batch]
+        'ds_ids': torch.tensor([b['ds_id'] for b in batch], dtype=torch.long),
+        'nt_ids': torch.tensor([b['nt_id'] for b in batch], dtype=torch.long),
+        'node_ids': torch.tensor([b['node_id'] for b in batch], dtype=torch.long),
+        'timestamps': torch.tensor([b['ts'] for b in batch], dtype=torch.float),
+        'task_ids': torch.tensor([b['task_id'] for b in batch], dtype=torch.long),
+        'labels': torch.stack([b['label'] for b in batch]),
+        
+        'test_subgraphs': [b['test_subgraph'] for b in batch],
+        'target_ents': [b['target_ent'] for b in batch],
+        'ctx_exs_list': [b['ctx_exs'] for b in batch]
     }
 
+def apply_dataset_prefix(graph, schema, ds_name):
+    prefix = f"{ds_name}__"
+    new_schema = {f"{prefix}{k}": v for k, v in schema.items()}
+    new_graph = TemporalHeterogeneousGraph()
+    for nt in graph.node_types:
+        new_nt = f"{prefix}{nt}"
+        new_graph.add_node_type(new_nt, graph.node_counts[nt], graph.node_features.get(nt), graph.node_timestamps.get(nt))
+    for et in graph.edge_types:
+        src, rel, dst = et
+        new_et = (f"{prefix}{src}", f"{prefix}{rel}", f"{prefix}{dst}")
+        new_graph.add_edge_type(new_et[1], (new_et[0], new_et[2]), graph.edge_indices[et], graph.edge_timestamps.get(et))
+    return new_graph, new_schema
+
+def setup_logger(rank):
+    root_logger = logging.getLogger()
+    if root_logger.hasHandlers():
+        root_logger.handlers.clear()
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    root_logger.addHandler(handler)
+    if rank == 0:
+        root_logger.setLevel(logging.INFO)
+    else:
+        root_logger.setLevel(logging.ERROR)
 
 class RelBenchTrainer:
-    """
-    RelBench specialized trainer
-    """
-
-    def __init__(self,
-                 model: KumoRFM,
-                 graph: 'TemporalHeterogeneousGraph',
-                 config: KumoRFMConfig,
-                 experiment_config: ExperimentConfig,
-                 task_config: 'TaskConfig',
-                 device: torch.device):
+    def __init__(self, model, config, exp_config, device, rank):
         self.model = model
-        self.graph = graph
         self.config = config
-        self.experiment_config = experiment_config
-        self.task_config = task_config
+        self.exp_config = exp_config
         self.device = device
+        self.rank = rank 
+        self.base_trainer = KumoRFMTrainer(model, config, exp_config, device)
+        self.cls_criterion = nn.CrossEntropyLoss()
+        self.reg_criterion = nn.MSELoss()
 
-        # Create base trainer
-        self.base_trainer = KumoRFMTrainer(
-            model, config, experiment_config, device
-        )
-        self.best_checkpoint_path = None
+    def train(self, train_loader, val_loader):
+        if self.rank == 0: logger.info("Starting DDP training loop...")
 
-        # Set task configuration
-        self.model.set_task_config(task_config)
+        best_val_loss = float('inf')
+        for epoch in range(self.exp_config.num_epochs):
+            train_loader.sampler.set_epoch(epoch)
+            train_loss = self._run_epoch(train_loader, epoch, is_train=True)
+            val_loss = self._run_epoch(val_loader, epoch, is_train=False)
+            
+            if self.rank == 0:
+                logger.info(f"Epoch {epoch+1}: Train Loss {train_loss:.4f}, Val Loss {val_loss:.4f}")
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    self._save_checkpoint(epoch, val_loss)
+            
+            if self.base_trainer.early_stopping(val_loss): break
 
-        # Loss function
-        self.criterion = self._get_criterion()
-
-    def _get_criterion(self):
-        """Get loss function"""
-        if self.task_config.task_type == 'classification':
-            # Use CrossEntropy for all classification (binary and multi-class)
-            return torch.nn.CrossEntropyLoss()
+    def _run_epoch(self, loader, epoch, is_train):
+        if is_train: self.model.train()
+        else: self.model.eval()
+        
+        total_loss = torch.tensor(0.0, device=self.device)
+        steps = torch.tensor(0.0, device=self.device)
+        
+        if self.rank == 0:
+            iterable = tqdm(loader, desc=f"Epoch {epoch+1} [{'Train' if is_train else 'Val'}]")
         else:
-            return torch.nn.MSELoss()
+            iterable = loader
+        
+        for batch in iterable:
+            ds_ids = batch['ds_ids'].to(self.device)
+            nt_ids = batch['nt_ids'].to(self.device)
+            node_ids = batch['node_ids'].to(self.device)
+            ts = batch['timestamps'].to(self.device)
+            task_ids = batch['task_ids'].to(self.device)
+            labels = batch['labels'].to(self.device)
+            
+            test_subgraphs = batch['test_subgraphs']
+            target_ents = batch['target_ents']
+            ctx_exs_list = batch['ctx_exs_list']
 
-    def train(self, train_loader: DataLoader, val_loader: DataLoader):
-        """Train model"""
-        logger.info("Starting training...")
+            if is_train: self.base_trainer.optimizer.zero_grad()
 
-        # Timing trackers
-        self.epoch_times: List[float] = []
-        self.train_start_iso = datetime.now().isoformat()
-        t0_total = time.time()
-
-        best_val_metric = float('inf') if self.task_config.task_type == 'regression' else 0.0
-
-        for epoch in range(self.experiment_config.num_epochs):
-            t0_epoch = time.time()
-            # Training phase
-            train_loss = self._train_epoch(train_loader, epoch)
-
-            # Validation phase
-            val_loss, val_metric = self._validate(val_loader)
-
-            # Logging
-            logger.info(f"Epoch {epoch + 1}/{self.experiment_config.num_epochs}")
-            logger.info(f"  Train Loss: {train_loss:.4f}")
-            logger.info(f"  Val Loss: {val_loss:.4f}")
-            logger.info(f"  Val Metric: {val_metric:.4f}")
-
-            # Epoch timing
-            epoch_time = time.time() - t0_epoch
-            self.epoch_times.append(epoch_time)
-            logger.info(f"  Epoch Time: {epoch_time:.2f}s")
-
-            # Save best model
-            if self._is_better(val_metric, best_val_metric):
-                best_val_metric = val_metric
-                self._save_checkpoint(epoch, val_metric)
-                logger.info(f"  New best model!")
-
-            # Early stopping check
-            if self.base_trainer.early_stopping(val_loss):
-                logger.info("Early stopping triggered, stopping training")
-                break
-
-        # Total timing
-        self.total_time_sec = time.time() - t0_total
-        self.train_end_iso = datetime.now().isoformat()
-        logger.info(f"Training completed in {self.total_time_sec:.2f}s. Best validation metric: {best_val_metric:.4f}")
-
-    def _train_epoch(self, train_loader: DataLoader, epoch: int) -> float:
-        """Train one epoch"""
-        self.model.train()
-        total_loss = 0.0
-
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1} [Train]")
-        for batch_idx, batch in enumerate(pbar):
-            # Prepare data
-            batch_data = self._prepare_batch(batch)
-
-            # Zero gradients
-            self.base_trainer.optimizer.zero_grad()
-
-            # Forward pass
-            loss = 0.0
-            for i in range(len(batch_data['entities'])):
-                output = self.model(
-                    self.graph,
-                    batch_data['entities'][i],
-                    batch_data['timestamps'][i],
-                    self.task_config,
-                    context_strategy='mixed',
-                    num_context=5
-                )
-
-                # Extract prediction
-                pred = self._extract_prediction(output)
-
-                # Calculate loss
-                if pred is not None:
-                    target = batch_data['labels'][i:i+1]
-                    if self.task_config.task_type == 'classification':
-                        target = target.long()
-
-                    item_loss = self.criterion(pred, target)
-                    loss += item_loss
-
-            # Average loss
-            loss = loss / len(batch_data['entities'])
-
-            # Backward pass
-            loss.backward()
-
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                self.config.gradient_clip
+            output = self.model(
+                dataset_ids=ds_ids, 
+                entity_type_ids=nt_ids, 
+                entity_ids=node_ids,
+                timestamps=ts, 
+                task_config_ids=task_ids,
+                test_subgraphs=test_subgraphs,
+                target_ents=target_ents,
+                ctx_exs_list=ctx_exs_list
             )
-
-            # Update parameters
-            self.base_trainer.optimizer.step()
-            self.base_trainer.scheduler.step()
-
-            # Logging
-            total_loss += loss.item()
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-
-        return total_loss / len(train_loader)
-
-    def _validate(self, val_loader: DataLoader) -> Tuple[float, float]:
-        """Validate model"""
-        self.model.eval()
-        total_loss = 0.0
-        all_preds = []
-        all_labels = []
-
-        with torch.no_grad():
-            pbar = tqdm(val_loader, desc="Validation")
-            for batch in pbar:
-                batch_data = self._prepare_batch(batch)
-
-                loss = 0.0
-                for i in range(len(batch_data['entities'])):
-                    output = self.model(
-                        self.graph,
-                        batch_data['entities'][i],
-                        batch_data['timestamps'][i],
-                        self.task_config,
-                        context_strategy='mixed',
-                        num_context=5
-                    )
-
-                    # Extract prediction
-                    pred = self._extract_prediction(output)
-
-                    if pred is not None:
-                        target = batch_data['labels'][i:i+1]
-                        if self.task_config.task_type == 'classification':
-                            target = target.long()
-
-                        item_loss = self.criterion(pred, target)
-                        loss += item_loss
-
-                        # Collect predictions
-                        if self.task_config.task_type == 'classification':
-                            # If logits vector, use argmax; if scalar logit, use sigmoid threshold
-                            if pred.dim() > 1 and pred.shape[-1] > 1:
-                                pred_class = pred.argmax(dim=-1).float()
-                            else:
-                                pred_class = (torch.sigmoid(pred) > 0.5).float()
-                            all_preds.append(pred_class.item())
-                        else:
-                            all_preds.append(pred.item())
-
-                        all_labels.append(batch_data['labels'][i].item())
-
-                loss = loss / len(batch_data['entities'])
+            preds = output['predictions']
+            
+            loss = torch.tensor(0.0, device=self.device)
+            valid = 0
+            unique_tasks = torch.unique(task_ids)
+            
+            for tid in unique_tasks:
+                mask = (task_ids == tid)
+                sub_pred = preds[mask]
+                sub_label = labels[mask]
+                t_conf = TASK_CONFIG_REGISTRY[tid.item()]
+                
+                if t_conf.task_type == 'classification':
+                    sub_label = sub_label.long()
+                    if sub_pred.shape[-1] > t_conf.num_classes:
+                        sub_pred = sub_pred[:, :t_conf.num_classes]
+                    l = self.cls_criterion(sub_pred, sub_label)
+                else:
+                    reg_pred = sub_pred[:, 0]
+                    sub_label = sub_label.view_as(reg_pred)
+                    l = self.reg_criterion(reg_pred, sub_label) * 0.1
+                
+                loss += l * mask.sum()
+                valid += mask.sum()
+            
+            if valid > 0:
+                loss = loss / valid
+                if is_train:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.base_trainer.optimizer.step()
+                    self.base_trainer.scheduler.step()
+                
                 total_loss += loss.item()
+                steps += 1.0
+                
+                if self.rank == 0:
+                    iterable.set_postfix({'loss': f'{loss.item():.4f}'})
+        
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(steps, op=dist.ReduceOp.SUM)
+        
+        return (total_loss / max(1.0, steps)).item()
 
-        # Calculate metric
-        avg_loss = total_loss / len(val_loader)
-        metric = self._calculate_metric(all_preds, all_labels)
+    def _save_checkpoint(self, epoch, metric):
+        path = Path(self.exp_config.save_dir) / 'best_model.pt'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        state = self.model.module.state_dict()
+        torch.save({'epoch': epoch, 'model': state}, path)
 
-        return avg_loss, metric
+def ddp_setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '29506' # Changed port again for safety
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
 
-    def evaluate(self, test_loader: DataLoader) -> Dict[str, float]:
-        """Evaluate model"""
-        logger.info("Evaluating model...")
+def ddp_cleanup():
+    dist.destroy_process_group()
 
-        test_loss, test_metric = self._validate(test_loader)
+def main_worker(rank, world_size, args):
+    ddp_setup(rank, world_size)
+    setup_logger(rank)
+    device = torch.device(f"cuda:{rank}")
+    set_random_seed(42 + rank) 
 
-        results = {
-            'test_loss': test_loss,
-            'test_metric': test_metric
-        }
-
-        # Add specific metric based on task type
-        if self.task_config.task_type == 'classification':
-            results['accuracy'] = test_metric
-        else:
-            results['mae'] = test_metric
-
-        return results
-
-    def _prepare_batch(self, batch: Dict) -> Dict:
-        """Prepare batch data"""
-        return {
-            'entities': batch['entities'],
-            'labels': batch['labels'].to(self.device),
-            'timestamps': batch['timestamps']
-        }
-
-    def _extract_prediction(self, output: Dict) -> Optional[torch.Tensor]:
-        """Extract prediction tensor from output"""
-        if 'predictions' in output:
-            pred = output['predictions']
-        elif 'probabilities' in output:
-            pred = torch.tensor(output['probabilities'])
-        elif 'predicted_value' in output:
-            pred = torch.tensor([[output['predicted_value']]], device=self.device)
-        else:
-            return None
-
-        if not isinstance(pred, torch.Tensor):
-            pred = torch.tensor(pred, device=self.device)
-
-        if pred.dim() == 0:
-            pred = pred.unsqueeze(0).unsqueeze(0)
-        elif pred.dim() == 1:
-            pred = pred.unsqueeze(0)
-
-        return pred
-
-    def _calculate_metric(self, preds: List[float], labels: List[float]) -> float:
-        """Calculate evaluation metric"""
-        preds = np.array(preds)
-        labels = np.array(labels)
-
-        if self.task_config.task_type == 'classification':
-            # Accuracy
-            return (preds == labels).mean()
-        else:
-            # MAE
-            return np.abs(preds - labels).mean()
-
-    def _is_better(self, current: float, best: float) -> bool:
-        """Determine if the current metric is better than the best"""
-        if self.task_config.task_type == 'classification':
-            return current > best
-        else:
-            return current < best
-
-    def _save_checkpoint(self, epoch: int, metric: float):
-        """Save checkpoint"""
-        checkpoint_path = Path(self.experiment_config.save_dir) / f'best_model.pt'
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.base_trainer.optimizer.state_dict(),
-            'metric': metric,
-            'config': self.config,
-            'task_config': self.task_config
-        }
-
-        torch.save(checkpoint, checkpoint_path)
-        self.best_checkpoint_path = checkpoint_path
-
-
-def main():
-    parser = argparse.ArgumentParser(description='Train KumoRFM on RelBench')
-
-    # Dataset arguments
-    parser.add_argument('--dataset', type=str, default='amazon',
-                       choices=['amazon', 'stack', 'f1', 'trial', 'avito', 'event', 'hm'],
-                       help='RelBench dataset name')
-    parser.add_argument('--task', type=str, default='auto', required=False,
-                       help="Task name (e.g., user-churn). Use 'auto' to infer/fallback.")
-
-    # Model arguments
-    parser.add_argument('--hidden-dim', type=int, default=256,
-                       help='Hidden dimension')
-    parser.add_argument('--num-layers', type=int, default=4,
-                       help='Number of layers')
-    parser.add_argument('--num-heads', type=int, default=8,
-                       help='Number of attention heads')
-    parser.add_argument('--dropout', type=float, default=0.3,
-                       help='Dropout rate')
-
-    # Training arguments
-    parser.add_argument('--epochs', type=int, default=50,
-                       help='Number of epochs')
-    parser.add_argument('--batch-size', type=int, default=32,
-                       help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-4,
-                       help='Learning rate')
-    parser.add_argument('--early-stopping-patience', type=int, default=10,
-                       help='Early stopping patience')
-
-    # Other arguments
-    parser.add_argument('--device', type=str, default='cuda',
-                       choices=['cuda', 'cpu'],
-                       help='Device to use')
-    parser.add_argument('--seed', type=int, default=42,
-                       help='Random seed')
-    parser.add_argument('--output-dir', type=str, default='./relbench_outputs',
-                       help='Output directory')
-    parser.add_argument('--dry-run', action='store_true',
-                       help='Run with a tiny synthetic dataset (no RelBench needed)')
-
-    args = parser.parse_args()
-
-    # Set device and random seed
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    set_random_seed(args.seed)
-    logger.info(f"Using device: {device}")
-
-    # Create output directory
-    output_dir = Path(args.output_dir) / f"{args.dataset}_{args.task}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Save configuration
-    with open(output_dir / 'config.json', 'w') as f:
-        json.dump(vars(args), f, indent=2)
-
-    # Prepare in-context label table + forward sampler
+    str_graph_map = {} 
+    combined_schema = {}
+    
+    target_ds = ['amazon','stack','f1','trial','avito','event','hm'] if args.dataset == 'ALL' else args.dataset.split(',')
+    sampling_config = SamplingConfig(num_hops=2, max_neighbors=10)
     label_table = InContextLabelTable()
-    forward_sampler = ForwardLabelSampler(label_table)
+    fwd_sampler = ForwardLabelSampler(label_table)
+    max_classes = 2
 
-    # Optionally run a tiny synthetic pipeline to validate end-to-end
-    if args.dry_run:
-        logger.info("Dry-run enabled: using a tiny synthetic dataset")
+    datasets = []
+    backward_sampler = BackwardSubgraphSampler(sampling_config)
+    context_sampler = ContextSampler(sampling_config, backward_sampler)
+    context_sampler.attach_label_table(label_table)
 
-        # Build a tiny graph with one node type and no edges
-        from data.temporal_graph import TemporalHeterogeneousGraph
-        graph = TemporalHeterogeneousGraph()
-        num_nodes = 20
-        features = torch.randn(num_nodes, args.hidden_dim)
-        graph.add_node_type('user', num_nodes, features=features)
-
-        # Minimal database schema
-        database_schema = {
-            'user': {
-                'feature': 'numerical',
-            }
-        }
-
-        # Task: binary classification on a single entity type
-        from config.model_config import TaskConfig
-        task_config = TaskConfig(task_type='classification', num_classes=2, target_column='label')
-
-        # Create synthetic splits
-        all_entities = [('user', i) for i in range(num_nodes)]
-        all_labels = (torch.rand(num_nodes) > 0.5).float().numpy()
-        base_time = datetime.now()
-        all_times = [base_time for _ in range(num_nodes)]
-
-        idx_train = list(range(0, int(num_nodes*0.6)))
-        idx_val = list(range(int(num_nodes*0.6), int(num_nodes*0.8)))
-        idx_test = list(range(int(num_nodes*0.8), num_nodes))
-
-        def subset(indices):
-            return {
-                'entities': [all_entities[i] for i in indices],
-                'labels': [all_labels[i] for i in indices],
-                'timestamps': [all_times[i] for i in indices],
-            }
-
-        data_splits = {
-            'train': subset(idx_train),
-            'val': subset(idx_val),
-            'test': subset(idx_test),
-        }
-    else:
-        # Load RelBench data (robust to dataset variants and availability)
-        logger.info(f"Loading RelBench dataset: {args.dataset}")
-        adapter = RelBenchAdapter(args.dataset)
-
-        def try_prepare(_adapter):
-            _dataset = _adapter.load_dataset()
-            _db = _adapter.convert_database()
-            _graph = _adapter.build_temporal_graph()
-            return _dataset, _db, _graph
-
-        candidates = [args.dataset, f"rel-{args.dataset}", "trial", "rel-trial", "stack", "rel-stack", "f1", "rel-f1"]
-        dataset = None
-        for cand in candidates:
-            try:
-                name = cand.replace("rel-", "")
-                adapter = RelBenchAdapter(name)
-                dataset, database, graph = try_prepare(adapter)
-                logger.info(f"Prepared dataset '{cand}' successfully")
-                break
-            except Exception as e:
-                logger.warning(f"Dataset candidate '{cand}' failed: {e}")
-                continue
-        if dataset is None:
-            raise RuntimeError("Failed to prepare any RelBench dataset. Ensure data is available locally.")
-
-        # Get database schema
-        database_schema = get_database_schema_from_relbench(dataset)
-
-        # Get task configuration
-        task_config = adapter.get_task_config(args.task)
-
-        # Get data splits
-        data_splits = adapter.get_train_test_split(args.task)
-
-    # Populate in-context label table (train + val splits as historical contexts)
-    forward_sampler.ingest_relbench_split(data_splits['train'], metadata={'split': 'train'})
-    if 'val' in data_splits:
-        forward_sampler.ingest_relbench_split(data_splits['val'], metadata={'split': 'val'})
-    label_table.finalize()
-
-    # Create datasets
-    train_dataset = RelBenchDataset(
-        graph,
-        data_splits['train']['entities'],
-        data_splits['train']['labels'],
-        data_splits['train']['timestamps'],
-        task_config
-    )
-
-    val_dataset = RelBenchDataset(
-        graph,
-        data_splits['val']['entities'],
-        data_splits['val']['labels'],
-        data_splits['val']['timestamps'],
-        task_config
-    )
-
-    test_dataset = RelBenchDataset(
-        graph,
-        data_splits['test']['entities'],
-        data_splits['test']['labels'],
-        data_splits['test']['timestamps'],
-        task_config
-    )
-
-    # Create data loaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collate_fn
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn
-    )
-
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn
-    )
-
-    # If classification, infer number of classes from data to avoid head-size mismatches
-    if task_config.task_type == 'classification':
+    for i, ds_name in enumerate(target_ds):
         try:
-            # Collect labels from train/val/test
-            all_labels = torch.cat([
-                train_dataset.labels.view(-1),
-                val_dataset.labels.view(-1),
-                test_dataset.labels.view(-1)
-            ])
-            inferred_num_classes = int(all_labels.max().item()) + 1 if all_labels.numel() > 0 else 2
-            if not task_config.num_classes or task_config.num_classes < inferred_num_classes:
-                logger.info(f"Adjusting num_classes from {task_config.num_classes} to {inferred_num_classes}")
-                task_config.num_classes = inferred_num_classes
+            if rank == 0: 
+                print(f"\n[Rank {rank}] Loading dataset {i+1}/{len(target_ds)}: {ds_name}...", flush=True)
+            
+            adapter = RelBenchAdapter(ds_name)
+            ds = adapter.load_dataset()
+            raw_g = adapter.build_temporal_graph()
+            raw_s = get_database_schema_from_relbench(ds)
+            pref_g, pref_s = apply_dataset_prefix(raw_g, raw_s, ds_name)
+            
+            # [CRITICAL OPTIMIZATION] Move to shared memory immediately
+            make_graph_shared(pref_g)
+            
+            str_graph_map[ds_name] = pref_g
+            combined_schema.update(pref_s)
+            
+            for nt in pref_g.node_types: 
+                get_registry_id(NODE_TYPE_REGISTRY, nt)
+            get_registry_id(DATASET_NAME_REGISTRY, ds_name)
+            
+            tasks = [args.task] if args.task != 'ALL' and args.task != 'auto' else list(ds.tasks.keys())
+            if not tasks and args.task=='auto': tasks = list(ds.tasks.keys())[:1]
+            
+            for t_name in tasks:
+                conf = adapter.get_task_config(t_name)
+                splits = adapter.get_train_test_split(t_name)
+                if conf.num_classes and conf.num_classes > max_classes: max_classes = conf.num_classes
+                
+                def fix_ent(split):
+                    split['entities'] = [(f"{ds_name}__{e}", i) for e, i in split['entities']]
+                    return split
+                
+                fwd_sampler.ingest_relbench_split(fix_ent(splits['train']))
+                if 'val' in splits: fwd_sampler.ingest_relbench_split(fix_ent(splits['val']))
+                
+                datasets.append(RelBenchDataset(
+                    splits['train']['entities'], 
+                    splits['train']['labels'], 
+                    splits['train']['timestamps'], 
+                    conf, 
+                    ds_name,
+                    pref_g, # Pass the shared memory graph object!
+                    backward_sampler, 
+                    context_sampler,
+                    node_type_registry=NODE_TYPE_REGISTRY
+                ))
+            
+            # Note: We CANNOT delete pref_g here because datasets hold references to it
+            # and it's needed for training.
+            del adapter, ds, raw_g, raw_s
+            gc.collect()
+            
         except Exception as e:
-            logger.warning(f"Could not infer number of classes from data: {e}")
+            if rank == 0: logger.error(f"Error loading {ds_name}: {e}")
 
-    # Create model configuration
-    model_config = KumoRFMConfig(
-        hidden_dim=args.hidden_dim,
-        num_layers=args.num_layers,
+    label_table.finalize()
+    
+    if not datasets: 
+        if rank == 0: logger.error("No datasets loaded. Exiting.")
+        ddp_cleanup()
+        return
+
+    if rank == 0: print(f"\n[Rank {rank}] All datasets loaded. Concatenating...", flush=True)
+    
+    full_ds = ConcatDataset(datasets)
+    sampler = DistributedSampler(full_ds, num_replicas=world_size, rank=rank)
+    
+    loader = DataLoader(
+        full_ds, 
+        batch_size=args.batch_size, 
+        shuffle=False, 
+        sampler=sampler,
+        collate_fn=collate_fn,
+        num_workers=4, # Safe to use workers now with Shared Memory
+        pin_memory=False,
+        persistent_workers=True
+    )
+    
+    conf = KumoRFMConfig(
+        hidden_dim=args.hidden_dim, 
+        num_layers=args.num_layers, 
         num_heads=args.num_heads,
         dropout_rate=args.dropout,
         batch_size=args.batch_size,
         learning_rate=args.lr
     )
-
-    experiment_config = ExperimentConfig(
+    
+    exp_config = ExperimentConfig(
         num_epochs=args.epochs,
         early_stopping_patience=args.early_stopping_patience,
-        save_dir=str(output_dir / 'checkpoints'),
-        log_dir=str(output_dir / 'logs')
+        save_dir=args.output_dir,
+        log_dir=str(Path(args.output_dir) / "logs")
     )
 
-    # Create model
-    logger.info("Creating KumoRFM model...")
-    model = KumoRFM(model_config, database_schema).to(device)
-    if hasattr(model, 'context_sampler'):
-        model.context_sampler.attach_label_table(label_table)
+    model = KumoRFM(conf, combined_schema)
+    tc_map = {i: c for i, c in enumerate(TASK_CONFIG_REGISTRY)}
+    ds_name_map = {n: i for i, n in enumerate(DATASET_NAME_REGISTRY)}
+    nt_map = {n: i for i, n in enumerate(NODE_TYPE_REGISTRY)}
+    
+    model.set_global_resources(str_graph_map, ds_name_map, nt_map, tc_map)
+    model.set_task_config(TaskConfig('classification', num_classes=max_classes))
+    model.backward_sampler = backward_sampler
+    model.context_sampler = context_sampler
+    
+    model = model.to(device)
+    model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+    
+    trainer = RelBenchTrainer(model, conf, exp_config, device, rank)
+    trainer.train(loader, loader)
+    
+    ddp_cleanup()
 
-    # Create trainer
-    trainer = RelBenchTrainer(
-        model, graph, model_config, experiment_config, task_config, device
-    )
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset', type=str, default='trial')
+    parser.add_argument('--task', type=str, default='auto')
+    parser.add_argument('--hidden-dim', type=int, default=256)
+    parser.add_argument('--num-layers', type=int, default=4)
+    parser.add_argument('--num-heads', type=int, default=8)
+    parser.add_argument('--dropout', type=float, default=0.3)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--batch-size', type=int, default=32)
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--early-stopping-patience', type=int, default=10)
+    parser.add_argument('--output-dir', type=str, default='./relbench_outputs')
+    parser.add_argument('--num-workers', type=int, default=4)
+    args, _ = parser.parse_known_args()
 
-    # Train model
-    trainer.train(train_loader, val_loader)
-
-    # Evaluate model
-    test_results = trainer.evaluate(test_loader)
-
-    # Save results
-    results = {
-        'dataset': args.dataset,
-        'task': args.task,
-        'config': vars(args),
-        'test_results': test_results,
-        'model_config': model_config.__dict__,
-        'task_config': task_config.__dict__,
-        'best_model_path': str(trainer.best_checkpoint_path) if trainer.best_checkpoint_path else None,
-        # Timing info
-        'epoch_times_sec': getattr(trainer, 'epoch_times', []),
-        'total_training_time_sec': getattr(trainer, 'total_time_sec', None),
-        'training_started_at': getattr(trainer, 'train_start_iso', None),
-        'training_finished_at': getattr(trainer, 'train_end_iso', None),
-    }
-
-    with open(output_dir / 'results.json', 'w') as f:
-        json.dump(results, f, indent=2)
-
-    logger.info(f"\nTest Results:")
-    for metric, value in test_results.items():
-        logger.info(f"  {metric}: {value:.4f}")
-
-    logger.info(f"\nAll results saved to: {output_dir}")
-
+    world_size = torch.cuda.device_count()
+    print(f"Spawning {world_size} processes for DDP training...", flush=True)
+    
+    mp.spawn(main_worker, args=(world_size, args), nprocs=world_size)
 
 if __name__ == '__main__':
     main()

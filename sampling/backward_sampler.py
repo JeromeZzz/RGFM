@@ -1,12 +1,13 @@
 """
 后向子图采样器
 用于构建预测时的输入特征子图
+(Fix: Ensure timezone-aware datetime generation)
 """
 
 import torch
 import numpy as np
 from typing import Dict, List, Tuple, Optional, Set
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 import random
 
@@ -88,7 +89,8 @@ class BackwardSubgraphSampler:
 
                     for neighbor_id, timestamp in neighbor_list:
                         # 检查时间约束
-                        if timestamp > prediction_time:
+                        # Ensure comparison handles timezone awareness by normalizing if needed
+                        if self._is_future(timestamp, prediction_time):
                             continue
 
                         # 添加节点
@@ -146,8 +148,8 @@ class BackwardSubgraphSampler:
             if edge_type in graph.edge_timestamps:
                 edge_timestamps = graph.edge_timestamps[edge_type]
             else:
-                # 如果没有时间戳，使用默认时间
-                edge_timestamps = torch.full((edge_index.shape[1],), 0.0)
+                # 如果没有时间戳，使用默认时间 (0.0)
+                edge_timestamps = torch.zeros(edge_index.shape[1])
 
             # 根据边的方向采样
             if source_type == node_type:
@@ -157,7 +159,10 @@ class BackwardSubgraphSampler:
                 valid_timestamps = edge_timestamps[mask]
 
                 # 时间过滤
-                time_mask = valid_timestamps <= self._datetime_to_timestamp(prediction_time)
+                # Use timestamp float comparison to avoid datetime issues here
+                pred_ts_float = self._datetime_to_timestamp(prediction_time)
+                time_mask = valid_timestamps <= pred_ts_float
+                
                 valid_neighbors = valid_neighbors[time_mask]
                 valid_timestamps = valid_timestamps[time_mask]
 
@@ -182,7 +187,9 @@ class BackwardSubgraphSampler:
                 valid_timestamps = edge_timestamps[mask]
 
                 # 时间过滤
-                time_mask = valid_timestamps <= self._datetime_to_timestamp(prediction_time)
+                pred_ts_float = self._datetime_to_timestamp(prediction_time)
+                time_mask = valid_timestamps <= pred_ts_float
+                
                 valid_neighbors = valid_neighbors[time_mask]
                 valid_timestamps = valid_timestamps[time_mask]
 
@@ -236,7 +243,6 @@ class BackwardSubgraphSampler:
 
         elif self.strategy == 'structure_aware':
             # 基于结构重要性采样（这里简化为度数）
-            # 实际实现应该考虑节点的结构重要性
             return torch.randperm(len(neighbors))[:max_neighbors].tolist()
 
         else:
@@ -321,5 +327,18 @@ class BackwardSubgraphSampler:
         return dt.timestamp()
 
     def _timestamp_to_datetime(self, ts: float) -> datetime:
-        """将时间戳转换为datetime"""
-        return datetime.fromtimestamp(ts)
+        """
+        将时间戳转换为datetime (UTC-Aware)
+        Fix: 使用 timezone.utc 确保生成的 datetime 带有时区信息，
+        以便与 adapter.py 生成的 prediction_time (UTC) 进行比较。
+        """
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+
+    def _is_future(self, ts1: datetime, ts2: datetime) -> bool:
+        """Safe comparison handling mixed naive/aware datetimes"""
+        # If mismatch, convert naive to aware (UTC)
+        if ts1.tzinfo is None and ts2.tzinfo is not None:
+            ts1 = ts1.replace(tzinfo=timezone.utc)
+        elif ts1.tzinfo is not None and ts2.tzinfo is None:
+            ts2 = ts2.replace(tzinfo=timezone.utc)
+        return ts1 > ts2
