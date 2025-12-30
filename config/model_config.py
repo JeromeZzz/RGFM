@@ -56,6 +56,15 @@ class ExperimentConfig:
     weight_decay: float = 1e-5
     wandb_project: Optional[str] = None
     seed: int = 42
+    
+    # [NEW] DDP / GPU Settings
+    nprocs: int = 1                  # Default number of DDP processes (GPUs)
+    
+    # [NEW] DataLoader Performance Parameters
+    num_workers: int = 0             # 0 means main process only (auto-detect logic handled in script if 0)
+    prefetch_factor: Optional[int] = 2 # Number of batches to prefetch per worker
+    pin_memory: bool = False          # Use page-locked memory for faster GPU transfer
+    persistent_workers: bool = False # Keep workers alive between epochs
 
 @dataclass
 class TaskConfig:
