@@ -1,17 +1,16 @@
 """
 KumoRFM Configuration Definitions
-
 """
 from dataclasses import dataclass, field
 from typing import Optional, List, Any
 
 @dataclass
 class SamplingConfig:
-    # Subgraph Sampling
+    # [CRITICAL FIX] Added num_hops to match call in train_on_relbench.py
     num_hops: int = 2
     max_neighbors: int = 10
     
-    # [Fix] Must be a List, not int. Defaulting to [10, 10] for 2-hop sampling.
+    # Per-hop sampling limits (must be list)
     max_neighbors_per_hop: List[int] = field(default_factory=lambda: [10, 10])
     
     strategy: str = 'recent'
@@ -56,12 +55,21 @@ class ExperimentConfig:
     weight_decay: float = 1e-5
     wandb_project: Optional[str] = None
     seed: int = 42
+    
+    # DDP / GPU Settings
+    nprocs: int = 1                  
+    
+    # DataLoader Performance Parameters
+    num_workers: int = 0             
+    prefetch_factor: Optional[int] = 2 
+    pin_memory: bool = False          
+    persistent_workers: bool = False 
 
 @dataclass
 class TaskConfig:
     task_type: str  # 'classification', 'regression', 'link_prediction'
     num_classes: int = 2
-    metric: str = 'auc' # or 'mae', 'rmse'
+    metric: str = 'auc' 
     target_column: Optional[str] = None
     
     # Time window fields
