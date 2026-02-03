@@ -1,6 +1,7 @@
 """
 RelBench Dataset Adapter
-(Fixed: 'NoneType' slicing bug + Restored Real Task Loading + Feature Scaling)
+Converts RelBench data to KumoRFM format
+(Final Version: Restored Loading Logic + Enhanced Feature Extraction)
 """
 
 import torch
@@ -12,7 +13,6 @@ import logging
 import warnings
 import os
 from pathlib import Path
-import torch.nn.functional as F
 
 # Suppress specific pandas warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="pandas")
@@ -32,6 +32,7 @@ try:
 except ImportError:
     raise ImportError("Please install RelBench: pip install relbench")
 
+# Ensure TaskType exists for comparison
 if not hasattr(TaskType, 'BINARY_CLASSIFICATION'):
     class MockTaskType:
         BINARY_CLASSIFICATION = 'BINARY_CLASSIFICATION'
@@ -46,7 +47,12 @@ from config.model_config import TaskConfig
 
 logger = logging.getLogger(__name__)
 
+
 class RelBenchAdapter:
+    """
+    Adapter from RelBench to KumoRFM
+    """
+
     NAME_ALIASES = {
         'amazon': ['amazon', 'rel-amazon'],
         'stack': ['stack', 'rel-stack', 'stackexchange', 'rel-stackexchange'],
@@ -62,13 +68,18 @@ class RelBenchAdapter:
         self.dataset = None
         self.database = None
         self.graph = None
+        
+        # ID Mapping: table_name -> {raw_id -> tensor_index}
         self.node_id_map = {}
-        self.printed_tables = set()
 
     def load_dataset(self) -> Any:
         logger.info(f"Loading RelBench dataset: {self.dataset_name} (Local/Docker Mode)")
         self.dataset = self._resolve_dataset(self.dataset_name)
         self._attempt_load_local_tasks()
+        if hasattr(self.dataset, 'tasks') and self.dataset.tasks:
+            logger.info(f"Loaded tasks from local storage: {list(self.dataset.tasks.keys())}")
+        else:
+            logger.warning("No local tasks found in 'tasks' folder. Please check your data mount.")
         return self.dataset
 
     def _resolve_dataset(self, key: str):
@@ -79,9 +90,14 @@ class RelBenchAdapter:
                 if ds: return ds
             except Exception:
                 continue
-        raise RuntimeError(f"Could not load dataset '{key}' locally.")
+        raise RuntimeError(
+            f"Could not load dataset '{key}' locally. Ensure the dataset 'db' folder is mounted."
+        )
 
     def _attempt_load_local_tasks(self):
+        """
+        [RESTORED] Original logic to find and load tasks from local directory
+        """
         candidates = self.NAME_ALIASES.get(self.dataset_name, [self.dataset_name])
         roots = [Path.home() / ".cache" / "relbench" / name for name in candidates]
         roots.append(Path("data") / self.dataset_name) 
@@ -93,19 +109,25 @@ class RelBenchAdapter:
                 break
         
         if not found_root:
+            logger.warning(f"Could not find a 'tasks' directory in {roots}")
             return
 
         logger.info(f"Found local tasks directory at: {found_root}/tasks")
+        
         if not hasattr(self.dataset, 'tasks') or self.dataset.tasks is None:
             self.dataset.tasks = {}
             
         tasks_dir = found_root / "tasks"
+        
         for task_path in tasks_dir.iterdir():
             if not task_path.is_dir(): continue
             task_name = task_path.name
             
             train_f = task_path / "train.parquet"
-            if train_f.exists():
+            val_f = task_path / "val.parquet"
+            test_f = task_path / "test.parquet"
+            
+            if train_f.exists() and val_f.exists() and test_f.exists():
                 try:
                     class MockTableWrapper:
                         def __init__(self, df, name=""): 
@@ -120,22 +142,36 @@ class RelBenchAdapter:
                             
                             cols = self.train_table.df.columns
                             self.timestamp_col = 'timestamp' if 'timestamp' in cols else None
+                            
                             if 'y' in cols: self.target_col = 'y'
                             elif 'label' in cols: self.target_col = 'label'
+                            elif 'churn' in cols: self.target_col = 'churn'
                             else: self.target_col = cols[-1] 
                             
                             target_series = self.train_table.df[self.target_col]
+                            is_float = pd.api.types.is_float_dtype(target_series)
                             nunique = target_series.nunique()
                             
-                            if 'item' in cols: self.task_type = getattr(TaskType, 'LINK_PREDICTION', 'link_prediction'); self.num_classes = 2
-                            elif nunique == 2: self.task_type = TaskType.BINARY_CLASSIFICATION; self.num_classes = 2
-                            else: self.task_type = TaskType.REGRESSION; self.num_classes = None
+                            # Heuristic Task Type Detection
+                            if 'item' in cols or 'artist' in cols or 'track' in cols: # Simple heuristic for LinkPred
+                                self.task_type = getattr(TaskType, 'LINK_PREDICTION', 'link_prediction')
+                                self.num_classes = 2
+                            elif is_float and nunique > 50:
+                                self.task_type = TaskType.REGRESSION
+                                self.num_classes = None
+                            elif nunique == 2:
+                                self.task_type = TaskType.BINARY_CLASSIFICATION
+                                self.num_classes = 2
+                            else:
+                                self.task_type = TaskType.MULTICLASS_CLASSIFICATION
+                                self.num_classes = nunique
+                            
                             self.entity_table = None 
 
                     self.dataset.tasks[task_name] = LocalTask(task_path, task_name)
-                    logger.info(f"  -> Registered local task: {task_name}")
+                    logger.debug(f"  -> Registered local task: {task_name}")
                 except Exception as e:
-                    logger.warning(f"Failed to load task {task_name}: {e}")
+                    logger.warning(f"  Failed to load local task {task_name}: {e}")
 
     def _get_db(self):
         if hasattr(self.dataset, 'get_db'): return self.dataset.get_db()
@@ -149,7 +185,7 @@ class RelBenchAdapter:
 
     def build_temporal_graph(self) -> TemporalHeterogeneousGraph:
         if not self.database: self.convert_database()
-        logger.info("Building temporal heterogeneous graph with SCALED features...")
+        logger.info("Building temporal heterogeneous graph with ENHANCED features...")
         self.graph = TemporalHeterogeneousGraph()
         db = self._get_db()
         
@@ -159,14 +195,14 @@ class RelBenchAdapter:
             num_nodes = len(df)
             self.node_id_map[table_name] = {uid: i for i, uid in enumerate(df.index)}
             
-            # [FIXED SCALING]
+            # [CHANGED] Use Enhanced Feature Extraction
             features = self._extract_enhanced_features(table_name, df)
             
             timestamps = self._extract_timestamps(table_name, df)
             if timestamps is None: timestamps = torch.zeros(num_nodes)
             self.graph.add_node_type(table_name, num_nodes, features, timestamps)
 
-        # Edges Logic
+        # Edges Logic (Unchanged)
         edge_count = 0
         for src_table_name, src_table in db.table_dict.items():
             fkeys = getattr(src_table, 'fkey_col_to_pkey_table', {})
@@ -174,20 +210,24 @@ class RelBenchAdapter:
                 if dst_table_name not in self.node_id_map: continue
                 edge_name = f"{src_table_name}_{src_col}_to_{dst_table_name}"
                 src_df = src_table.df
-                if not src_df[src_col].notna().any(): continue
-                valid_df = src_df[src_df[src_col].notna()]
+                valid_mask = src_df[src_col].notna()
+                if not valid_mask.any(): continue
+                valid_df = src_df[valid_mask]
                 
-                src_indices_np = np.where(src_df[src_col].notna())[0]
+                src_indices_np = np.where(valid_mask)[0]
                 dst_raw_ids = valid_df[src_col].values
                 dst_map = self.node_id_map[dst_table_name]
                 dst_indices_series = pd.Series(dst_raw_ids).map(dst_map)
-                if not dst_indices_series.notna().any(): continue
+                valid_edge_mask = dst_indices_series.notna()
+                if valid_edge_mask.sum() == 0: continue
                     
-                final_src = src_indices_np[dst_indices_series.notna().values]
-                final_dst = dst_indices_series.dropna().astype(int).values
+                final_src = src_indices_np[valid_edge_mask.values]
+                final_dst = dst_indices_series[valid_edge_mask].astype(int).values
                 
                 edge_index = torch.stack([torch.from_numpy(final_src), torch.from_numpy(final_dst)], dim=0).long()
-                edge_ts = self.graph.node_timestamps[src_table_name][final_src] if src_table_name in self.graph.node_timestamps else None
+                edge_ts = None
+                if src_table_name in self.graph.node_timestamps:
+                    edge_ts = self.graph.node_timestamps[src_table_name][final_src]
 
                 self.graph.add_edge_type(edge_name, (src_table_name, dst_table_name), edge_index, edge_ts)
                 rev_name = f"{dst_table_name}_rev_{src_table_name}_{src_col}"
@@ -200,51 +240,42 @@ class RelBenchAdapter:
 
     def _extract_enhanced_features(self, table_name, df) -> torch.Tensor:
         """
-        Extract features with BALANCED SCALES (Mean~0, Std~1 for all).
+        [NEW] Extract features including Hashed Strings/Categories.
+        Replaces the old _extract_node_features which dropped all text.
         """
-        target_dim = 256
+        target_dim = 32
         features_list = []
         
-        # 1. Numerical Features (Standardized)
+        # 1. Numerical Features (Normalized)
         num_df = df.select_dtypes(include=[np.number])
         if not num_df.empty:
             vals = num_df.fillna(0).values.astype(np.float32)
+            # Log normalize large values to prevent gradient explosion
             mask = np.abs(vals) > 1.0
             vals[mask] = np.sign(vals[mask]) * np.log1p(np.abs(vals[mask]))
-            
-            # Standardization
-            mean = np.mean(vals, axis=0)
-            std = np.std(vals, axis=0) + 1e-6
-            vals = (vals - mean) / std
-            vals = np.clip(vals, -5.0, 5.0)
             features_list.append(torch.from_numpy(vals))
 
-        # 2. Categorical / String Features (Scaled Hash)
+        # 2. Categorical / String Features (Hashing)
         cat_df = df.select_dtypes(exclude=[np.number, 'datetime', 'datetimetz'])
         if not cat_df.empty:
+            # We map strings to a fixed embedding space via Hashing
             hashed_feats = []
             for col in cat_df.columns:
                 s_vals = cat_df[col].astype(str).values
                 hashes = pd.util.hash_array(s_vals, encoding='utf8')
-                # Center and Scale
-                h_norm = (hashes % 100000) / 100000.0 - 0.5
-                h_norm = h_norm * 4.0 # Match numerical scale
+                # Normalize hash to [-1, 1] approximately
+                h_norm = (hashes % 10000) / 5000.0 - 1.0 
                 hashed_feats.append(torch.from_numpy(h_norm).unsqueeze(1).float())
             
             if hashed_feats:
                 features_list.append(torch.cat(hashed_feats, dim=1))
 
         if not features_list:
-            full_feat = torch.zeros((len(df), target_dim))
-        else:
-            full_feat = torch.cat(features_list, dim=1)
+            return torch.zeros((len(df), target_dim))
         
-        if table_name not in self.printed_tables and full_feat.shape[0] > 10:
-            self.printed_tables.add(table_name)
-            f_mean = full_feat.mean().item()
-            f_std = full_feat.std().item()
-            print(f"[SCALING CHECK] {table_name}: Mean={f_mean:.3f}, Std={f_std:.3f} (Ideal: ~0, ~1)")
-
+        full_feat = torch.cat(features_list, dim=1)
+        
+        # Project/Pad/Truncate to target_dim
         curr_dim = full_feat.shape[1]
         if curr_dim > target_dim:
             return full_feat[:, :target_dim]
@@ -299,17 +330,12 @@ class RelBenchAdapter:
         return TaskConfig(task_type=task_type, num_classes=num_classes, target_column=target_col, time_window_end=0)
 
     def get_train_test_split(self, task_name: str) -> Dict[str, Any]:
-        """
-        [RESTORED] Correct logic to use real tasks OR fallback to random split
-        """
         if not self.dataset: self.load_dataset()
         task = None
         if hasattr(self.dataset, 'tasks'):
             tasks = getattr(self.dataset, 'tasks')
             if task_name == 'auto' and tasks: task_name = list(tasks.keys())[0]
             task = tasks.get(task_name)
-        
-        # If no real task found, use random fallback
         if not task: return self._create_random_split()
 
         def get_table(prefix):
@@ -318,19 +344,14 @@ class RelBenchAdapter:
             name = getattr(task, f"{prefix}_table_name", None)
             return self._get_db().table_dict.get(name) if name else None
 
-        train_table = get_table('train')
-        # If task object exists but tables are missing, fallback
-        if train_table is None: return self._create_random_split()
-
         return {
-            'train': self._extract_data(train_table, task),
+            'train': self._extract_data(get_table('train'), task),
             'val': self._extract_data(get_table('val'), task),
             'test': self._extract_data(get_table('test'), task)
         }
 
     def _create_random_split(self):
         db = self._get_db()
-        # Fallback to first table if no specific task
         tname, table = next(iter(db.table_dict.items()))
         class MockTask:
             entity_table = tname
@@ -339,19 +360,10 @@ class RelBenchAdapter:
         full = self._extract_data(table, MockTask())
         n = len(full['entities'])
         idx = np.random.permutation(n)
-        
-        # [FIX] Handle None values (e.g. dst_entities) safely
-        def sub(i):
-            res = {}
-            for k, v in full.items():
-                if v is None: res[k] = None
-                else: res[k] = [v[x] for x in i]
-            return res
-            
+        def sub(i): return {k: [full[k][x] for x in i] for k in full}
         return {'train': sub(idx[:int(0.7*n)]), 'val': sub(idx[int(0.7*n):int(0.85*n)]), 'test': sub(idx[int(0.85*n):])}
 
     def _extract_data(self, table, task) -> Dict:
-        if table is None: return {}
         df = table.df
         etype = getattr(task, 'entity_table', None)
         if not etype:
@@ -424,17 +436,28 @@ class RelBenchDatabase(KumoDatabase):
     def get_relationships(self): return []
 
 class RelBenchGraphConverter:
-    def __init__(self): pass
+    """
+    RelBench Graph Converter
+    Restored class to satisfy imports in train scripts
+    """
+    def __init__(self):
+        self.node_mapping = {}
+        self.edge_mapping = {}
+
     def convert(self, database: RelBenchDatabase, dataset: Dataset) -> TemporalHeterogeneousGraph:
+        """
+        Convert database to graph
+        Delegates to RelBenchAdapter's robust logic
+        """
         adapter = RelBenchAdapter(dataset.name)
         adapter.dataset = dataset
         adapter.database = database
         return adapter.build_temporal_graph()
 
 def get_database_schema_from_relbench(dataset) -> Dict:
+    schema = {}
     db = dataset.get_db() if hasattr(dataset, 'get_db') else getattr(dataset, 'db', None)
     if not db: return {}
-    schema = {}
     for name, table in db.table_dict.items():
         types = {}
         for c in table.df.columns:
