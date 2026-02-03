@@ -1,0 +1,223 @@
+2026-02-02 16:25:50,662 - utils.training_utils - INFO - Random seed set to 42
+2026-02-02 16:25:50,662 - relbdata.adapter - INFO - Loading RelBench dataset: trial (Local/Docker Mode)
+2026-02-02 16:25:50,662 - relbdata.adapter - INFO - Found local tasks directory at: /home/wzzhao/.cache/relbench/rel-trial/tasks
+2026-02-02 16:25:50,688 - relbdata.adapter - INFO - Loaded tasks from local storage: ['study-outcome', 'site-success', 'study-adverse']
+2026-02-02 16:25:54,233 - relbdata.adapter - INFO - Building temporal heterogeneous graph with ENHANCED features...
+2026-02-02 16:26:05,015 - relbdata.adapter - INFO - Graph built: 5434924 nodes, 15335102 edges
+2026-02-02 16:26:06,864 - utils.training_utils - INFO - Created adamw optimizer, lr=0.0001
+2026-02-02 16:26:06,864 - utils.training_utils - INFO - Created cosine learning-rate scheduler
+2026-02-02 16:26:06,864 - __mp_main__ - INFO - Starting DDP training loop...
+2026-02-02 16:29:17,969 - utils.training_utils - INFO - Random seed set to 42
+2026-02-02 16:29:17,969 - relbdata.adapter - INFO - Loading RelBench dataset: trial (Local/Docker Mode)
+2026-02-02 16:29:17,969 - relbdata.adapter - INFO - Found local tasks directory at: /home/wzzhao/.cache/relbench/rel-trial/tasks
+2026-02-02 16:29:17,991 - relbdata.adapter - INFO - Loaded tasks from local storage: ['study-outcome', 'site-success', 'study-adverse']
+2026-02-02 16:29:21,606 - relbdata.adapter - INFO - Building temporal heterogeneous graph with ENHANCED features...
+2026-02-02 16:29:32,532 - relbdata.adapter - INFO - Graph built: 5434924 nodes, 15335102 edges
+2026-02-02 16:29:34,485 - utils.training_utils - INFO - Created adamw optimizer, lr=0.0001
+2026-02-02 16:29:34,485 - utils.training_utils - INFO - Created cosine learning-rate scheduler
+2026-02-02 16:29:34,485 - __mp_main__ - INFO - Starting DDP training loop...
+2026-02-02 16:34:08,331 - utils.training_utils - INFO - Random seed set to 42
+2026-02-02 16:34:08,332 - relbdata.adapter - INFO - Loading RelBench dataset: trial (Local/Docker Mode)
+2026-02-02 16:34:08,332 - relbdata.adapter - INFO - Found local tasks directory at: /home/wzzhao/.cache/relbench/rel-trial/tasks
+2026-02-02 16:34:08,361 - relbdata.adapter - INFO - Loaded tasks from local storage: ['study-outcome', 'site-success', 'study-adverse']
+2026-02-02 16:34:11,969 - relbdata.adapter - INFO - Building temporal heterogeneous graph with ENHANCED features...
+2026-02-02 16:34:22,770 - relbdata.adapter - INFO - Graph built: 5434924 nodes, 15335102 edges
+2026-02-02 16:34:24,697 - utils.training_utils - INFO - Created adamw optimizer, lr=0.0001
+2026-02-02 16:34:24,697 - utils.training_utils - INFO - Created cosine learning-rate scheduler
+2026-02-02 16:34:24,697 - __mp_main__ - INFO - Starting DDP training loop...
+2026-02-02 16:39:32,261 - __mp_main__ - INFO - Epoch 1: Train Loss 0.6634, Val Loss 0.6858
+2026-02-02 16:44:38,170 - __mp_main__ - INFO - Epoch 2: Train Loss 0.6580, Val Loss 0.6943
+2026-02-02 16:44:38,170 - utils.training_utils - INFO - EarlyStopping counter: 1 out of 15
+2026-02-02 16:49:26,854 - utils.training_utils - INFO - Random seed set to 42
+2026-02-02 16:49:26,854 - relbdata.adapter - INFO - Loading RelBench dataset: trial (Local/Docker Mode)
+2026-02-02 16:49:26,854 - relbdata.adapter - INFO - Found local tasks directory at: /home/wzzhao/.cache/relbench/rel-trial/tasks
+2026-02-02 16:49:26,876 - relbdata.adapter - INFO - Loaded tasks from local storage: ['study-outcome', 'site-success', 'study-adverse']
+2026-02-02 16:49:30,487 - relbdata.adapter - INFO - Building temporal heterogeneous graph with ENHANCED features...
+2026-02-02 16:49:41,495 - relbdata.adapter - INFO - Graph built: 5434924 nodes, 15335102 edges
+2026-02-02 16:49:43,299 - utils.training_utils - INFO - Created adamw optimizer, lr=0.0001
+2026-02-02 16:49:43,299 - utils.training_utils - INFO - Created cosine learning-rate scheduler
+2026-02-02 16:49:43,299 - __mp_main__ - INFO - Starting DDP training loop...
+2026-02-02 16:54:49,284 - __mp_main__ - INFO - Epoch 1: Train Loss 0.6646, Val Loss 0.6892
+2026-02-02 16:59:58,075 - __mp_main__ - INFO - Epoch 2: Train Loss 0.6581, Val Loss 0.6916
+2026-02-02 16:59:58,075 - utils.training_utils - INFO - EarlyStopping counter: 1 out of 15
+2026-02-02 17:05:06,701 - __mp_main__ - INFO - Epoch 3: Train Loss 0.6590, Val Loss 0.6865
+2026-02-02 17:10:14,587 - __mp_main__ - INFO - Epoch 4: Train Loss 0.6564, Val Loss 0.6904
+2026-02-02 17:10:14,587 - utils.training_utils - INFO - EarlyStopping counter: 1 out of 15
+2026-02-02 17:12:17,900 - utils.training_utils - INFO - Random seed set to 42
+2026-02-02 17:12:17,900 - relbdata.adapter - INFO - Loading RelBench dataset: trial (Local/Docker Mode)
+2026-02-02 17:12:17,900 - relbdata.adapter - INFO - Found local tasks directory at: /home/wzzhao/.cache/relbench/rel-trial/tasks
+2026-02-02 17:12:17,925 - relbdata.adapter - INFO - Loaded tasks from local storage: ['study-outcome', 'site-success', 'study-adverse']
+2026-02-02 17:12:21,474 - relbdata.adapter - INFO - Building temporal heterogeneous graph with ENHANCED features...
+2026-02-02 17:12:32,350 - relbdata.adapter - INFO - Graph built: 5434924 nodes, 15335102 edges
+2026-02-02 17:12:34,137 - utils.training_utils - INFO - Created adamw optimizer, lr=0.0003
+2026-02-02 17:12:34,137 - utils.training_utils - INFO - Created cosine learning-rate scheduler
+2026-02-02 17:12:34,137 - __mp_main__ - INFO - Starting DDP training loop...
+2026-02-02 17:17:40,064 - __mp_main__ - INFO - Epoch 1: Train Loss 0.6671, Val Loss 0.6867
+2026-02-02 17:22:51,267 - __mp_main__ - INFO - Epoch 2: Train Loss 0.6583, Val Loss 0.6914
+2026-02-02 17:22:51,267 - utils.training_utils - INFO - EarlyStopping counter: 1 out of 15
+2026-02-02 17:28:00,445 - __mp_main__ - INFO - Epoch 3: Train Loss 0.6584, Val Loss 0.6866
+2026-02-02 17:33:11,091 - __mp_main__ - INFO - Epoch 4: Train Loss 0.6572, Val Loss 0.6899
+2026-02-02 17:33:11,091 - utils.training_utils - INFO - EarlyStopping counter: 1 out of 15
+2026-02-02 17:38:17,914 - __mp_main__ - INFO - Epoch 5: Train Loss 0.6567, Val Loss 0.6875
+2026-02-02 17:38:17,914 - utils.training_utils - INFO - EarlyStopping counter: 2 out of 15
+2026-02-02 17:43:32,120 - __mp_main__ - INFO - Epoch 6: Train Loss 0.6564, Val Loss 0.6844
+2026-02-02 17:48:38,829 - __mp_main__ - INFO - Epoch 7: Train Loss 0.6569, Val Loss 0.6868
+2026-02-02 17:48:38,829 - utils.training_utils - INFO - EarlyStopping counter: 1 out of 15
+2026-02-02 17:53:44,703 - __mp_main__ - INFO - Epoch 8: Train Loss 0.6558, Val Loss 0.6898
+2026-02-02 17:53:44,703 - utils.training_utils - INFO - EarlyStopping counter: 2 out of 15
+2026-02-02 17:55:53,709 - utils.training_utils - INFO - Random seed set to 42
+2026-02-02 17:55:53,709 - relbdata.adapter - INFO - Loading RelBench dataset: trial (Local/Docker Mode)
+2026-02-02 17:55:53,710 - relbdata.adapter - INFO - Found local tasks directory at: /home/wzzhao/.cache/relbench/rel-trial/tasks
+2026-02-02 17:55:53,731 - relbdata.adapter - INFO - Loaded tasks from local storage: ['study-outcome', 'site-success', 'study-adverse']
+2026-02-02 17:55:57,358 - relbdata.adapter - INFO - Building temporal heterogeneous graph with ENHANCED features...
+2026-02-02 17:56:08,301 - relbdata.adapter - INFO - Graph built: 5434924 nodes, 15335102 edges
+2026-02-02 17:56:10,261 - utils.training_utils - INFO - Created adamw optimizer, lr=0.0003
+2026-02-02 17:56:10,261 - utils.training_utils - INFO - Created cosine learning-rate scheduler
+2026-02-02 17:56:10,261 - __mp_main__ - INFO - Starting DDP training loop...
+2026-02-02 18:01:42,365 - utils.training_utils - INFO - Random seed set to 42
+2026-02-02 18:01:42,366 - relbdata.adapter - INFO - Loading RelBench dataset: trial (Local/Docker Mode)
+2026-02-02 18:01:42,366 - relbdata.adapter - INFO - Found local tasks directory at: /home/wzzhao/.cache/relbench/rel-trial/tasks
+2026-02-02 18:01:42,393 - relbdata.adapter - INFO - Loaded tasks from local storage: ['study-outcome', 'site-success', 'study-adverse']
+2026-02-02 18:01:46,057 - relbdata.adapter - INFO - Building temporal heterogeneous graph with HIGH-RES features...
+2026-02-02 18:01:57,343 - relbdata.adapter - INFO - Graph built: 5434924 nodes, 15335102 edges
+2026-02-02 18:01:59,426 - utils.training_utils - INFO - Created adamw optimizer, lr=0.0003
+2026-02-02 18:01:59,426 - utils.training_utils - INFO - Created cosine learning-rate scheduler
+2026-02-02 18:01:59,426 - __mp_main__ - INFO - Starting DDP training loop...
+2026-02-02 18:03:58,304 - utils.training_utils - INFO - Random seed set to 42
+2026-02-02 18:03:58,304 - relbdata.adapter - INFO - Loading RelBench dataset: trial (Local/Docker Mode)
+2026-02-02 18:03:58,304 - relbdata.adapter - INFO - Found local tasks directory at: /home/wzzhao/.cache/relbench/rel-trial/tasks
+2026-02-02 18:03:58,330 - relbdata.adapter - INFO - Loaded tasks from local storage: ['study-outcome', 'site-success', 'study-adverse']
+2026-02-02 18:04:01,887 - relbdata.adapter - INFO - Building temporal heterogeneous graph with HIGH-RES features...
+2026-02-02 18:04:13,465 - relbdata.adapter - INFO - Graph built: 5434924 nodes, 15335102 edges
+2026-02-02 18:04:18,080 - utils.training_utils - INFO - Created adamw optimizer, lr=0.0003
+2026-02-02 18:04:18,080 - utils.training_utils - INFO - Created cosine learning-rate scheduler
+2026-02-02 18:04:18,080 - __mp_main__ - INFO - Starting DDP training loop...
+2026-02-02 18:08:27,420 - utils.training_utils - INFO - Random seed set to 42
+2026-02-02 18:08:27,420 - relbdata.adapter - INFO - Loading RelBench dataset: trial (Local/Docker Mode)
+2026-02-02 18:08:27,420 - relbdata.adapter - INFO - Found local tasks directory at: /home/wzzhao/.cache/relbench/rel-trial/tasks
+2026-02-02 18:08:27,446 - relbdata.adapter - INFO - Loaded tasks from local storage: ['study-outcome', 'site-success', 'study-adverse']
+2026-02-02 18:08:31,055 - relbdata.adapter - INFO - Building temporal heterogeneous graph with HIGH-RES features...
+2026-02-02 18:08:43,646 - relbdata.adapter - INFO - Graph built: 5434924 nodes, 15335102 edges
+2026-02-02 18:09:54,616 - utils.training_utils - INFO - Created adamw optimizer, lr=0.0003
+2026-02-02 18:09:54,616 - utils.training_utils - INFO - Created cosine learning-rate scheduler
+2026-02-02 18:09:54,616 - __mp_main__ - INFO - Starting DDP training loop...
+2026-02-02 18:19:19,929 - __mp_main__ - INFO - Epoch 1: Train Loss 0.6688, Val Loss 0.6902
+2026-02-02 18:24:26,345 - __mp_main__ - INFO - Epoch 2: Train Loss 0.6586, Val Loss 0.6955
+2026-02-02 18:24:26,345 - utils.training_utils - INFO - EarlyStopping counter: 1 out of 15
+2026-02-02 18:29:33,210 - __mp_main__ - INFO - Epoch 3: Train Loss 0.6582, Val Loss 0.6837
+2026-02-02 18:34:41,342 - __mp_main__ - INFO - Epoch 4: Train Loss 0.6569, Val Loss 0.6866
+2026-02-02 18:34:41,342 - utils.training_utils - INFO - EarlyStopping counter: 1 out of 15
+2026-02-02 18:39:50,303 - __mp_main__ - INFO - Epoch 5: Train Loss 0.6576, Val Loss 0.6912
+2026-02-02 18:39:50,303 - utils.training_utils - INFO - EarlyStopping counter: 2 out of 15
+2026-02-02 18:44:57,995 - __mp_main__ - INFO - Epoch 6: Train Loss 0.6564, Val Loss 0.6854
+2026-02-02 18:44:57,995 - utils.training_utils - INFO - EarlyStopping counter: 3 out of 15
+2026-02-02 18:50:08,397 - __mp_main__ - INFO - Epoch 7: Train Loss 0.6571, Val Loss 0.6861
+2026-02-02 18:50:08,397 - utils.training_utils - INFO - EarlyStopping counter: 4 out of 15
+2026-02-02 18:55:15,211 - __mp_main__ - INFO - Epoch 8: Train Loss 0.6559, Val Loss 0.6910
+2026-02-02 18:55:15,211 - utils.training_utils - INFO - EarlyStopping counter: 5 out of 15
+2026-02-02 19:00:21,700 - __mp_main__ - INFO - Epoch 9: Train Loss 0.6561, Val Loss 0.6881
+2026-02-02 19:00:21,700 - utils.training_utils - INFO - EarlyStopping counter: 6 out of 15
+2026-02-02 19:05:28,736 - __mp_main__ - INFO - Epoch 10: Train Loss 0.6554, Val Loss 0.6875
+2026-02-02 19:05:28,736 - utils.training_utils - INFO - EarlyStopping counter: 7 out of 15
+2026-02-02 19:10:41,047 - __mp_main__ - INFO - Epoch 11: Train Loss 0.6559, Val Loss 0.6872
+2026-02-02 19:10:41,047 - utils.training_utils - INFO - EarlyStopping counter: 8 out of 15
+2026-02-02 19:15:52,350 - __mp_main__ - INFO - Epoch 12: Train Loss 0.6554, Val Loss 0.6876
+2026-02-02 19:15:52,350 - utils.training_utils - INFO - EarlyStopping counter: 9 out of 15
+2026-02-02 19:20:58,398 - __mp_main__ - INFO - Epoch 13: Train Loss 0.6559, Val Loss 0.6878
+2026-02-02 19:20:58,398 - utils.training_utils - INFO - EarlyStopping counter: 10 out of 15
+2026-02-02 19:26:03,346 - __mp_main__ - INFO - Epoch 14: Train Loss 0.6556, Val Loss 0.6870
+2026-02-02 19:26:03,346 - utils.training_utils - INFO - EarlyStopping counter: 11 out of 15
+2026-02-02 19:31:10,278 - __mp_main__ - INFO - Epoch 15: Train Loss 0.6553, Val Loss 0.6926
+2026-02-02 19:31:10,278 - utils.training_utils - INFO - EarlyStopping counter: 12 out of 15
+2026-02-02 19:36:19,325 - __mp_main__ - INFO - Epoch 16: Train Loss 0.6557, Val Loss 0.6825
+2026-02-02 19:41:25,579 - __mp_main__ - INFO - Epoch 17: Train Loss 0.6565, Val Loss 0.7018
+2026-02-02 19:41:25,579 - utils.training_utils - INFO - EarlyStopping counter: 1 out of 15
+2026-02-02 19:46:33,425 - __mp_main__ - INFO - Epoch 18: Train Loss 0.6564, Val Loss 0.6820
+2026-02-02 19:51:41,895 - __mp_main__ - INFO - Epoch 19: Train Loss 0.6564, Val Loss 0.6857
+2026-02-02 19:51:41,895 - utils.training_utils - INFO - EarlyStopping counter: 1 out of 15
+2026-02-02 19:56:48,791 - __mp_main__ - INFO - Epoch 20: Train Loss 0.6559, Val Loss 0.6805
+2026-02-02 20:01:55,050 - __mp_main__ - INFO - Epoch 21: Train Loss 0.6559, Val Loss 0.7061
+2026-02-02 20:01:55,050 - utils.training_utils - INFO - EarlyStopping counter: 1 out of 15
+2026-02-02 20:07:02,134 - __mp_main__ - INFO - Epoch 22: Train Loss 0.6548, Val Loss 0.6970
+2026-02-02 20:07:02,134 - utils.training_utils - INFO - EarlyStopping counter: 2 out of 15
+2026-02-02 20:12:09,123 - __mp_main__ - INFO - Epoch 23: Train Loss 0.6547, Val Loss 0.6826
+2026-02-02 20:12:09,123 - utils.training_utils - INFO - EarlyStopping counter: 3 out of 15
+2026-02-02 20:17:19,087 - __mp_main__ - INFO - Epoch 24: Train Loss 0.6533, Val Loss 0.6857
+2026-02-02 20:17:19,088 - utils.training_utils - INFO - EarlyStopping counter: 4 out of 15
+2026-02-02 20:22:26,919 - __mp_main__ - INFO - Epoch 25: Train Loss 0.6530, Val Loss 0.6941
+2026-02-02 20:22:26,919 - utils.training_utils - INFO - EarlyStopping counter: 5 out of 15
+2026-02-02 20:27:32,369 - __mp_main__ - INFO - Epoch 26: Train Loss 0.6509, Val Loss 0.6857
+2026-02-02 20:27:32,369 - utils.training_utils - INFO - EarlyStopping counter: 6 out of 15
+2026-02-02 20:32:40,450 - __mp_main__ - INFO - Epoch 27: Train Loss 0.6486, Val Loss 0.6892
+2026-02-02 20:32:40,450 - utils.training_utils - INFO - EarlyStopping counter: 7 out of 15
+2026-02-02 20:37:48,735 - __mp_main__ - INFO - Epoch 28: Train Loss 0.6475, Val Loss 0.6954
+2026-02-02 20:37:48,735 - utils.training_utils - INFO - EarlyStopping counter: 8 out of 15
+2026-02-02 20:42:55,299 - __mp_main__ - INFO - Epoch 29: Train Loss 0.6475, Val Loss 0.6894
+2026-02-02 20:42:55,299 - utils.training_utils - INFO - EarlyStopping counter: 9 out of 15
+2026-02-02 20:48:03,021 - __mp_main__ - INFO - Epoch 30: Train Loss 0.6448, Val Loss 0.6861
+2026-02-02 20:48:03,021 - utils.training_utils - INFO - EarlyStopping counter: 10 out of 15
+2026-02-02 20:53:11,847 - __mp_main__ - INFO - Epoch 31: Train Loss 0.6441, Val Loss 0.6917
+2026-02-02 20:53:11,847 - utils.training_utils - INFO - EarlyStopping counter: 11 out of 15
+2026-02-02 20:58:16,833 - __mp_main__ - INFO - Epoch 32: Train Loss 0.6442, Val Loss 0.6916
+2026-02-02 20:58:16,833 - utils.training_utils - INFO - EarlyStopping counter: 12 out of 15
+2026-02-02 21:03:21,674 - __mp_main__ - INFO - Epoch 33: Train Loss 0.6450, Val Loss 0.6908
+2026-02-02 21:03:21,674 - utils.training_utils - INFO - EarlyStopping counter: 13 out of 15
+2026-02-02 21:08:29,327 - __mp_main__ - INFO - Epoch 34: Train Loss 0.6433, Val Loss 0.6884
+2026-02-02 21:08:29,327 - utils.training_utils - INFO - EarlyStopping counter: 14 out of 15
+2026-02-02 21:13:33,216 - __mp_main__ - INFO - Epoch 35: Train Loss 0.6451, Val Loss 0.6937
+2026-02-02 21:13:33,216 - utils.training_utils - INFO - EarlyStopping counter: 15 out of 15
+2026-02-02 21:13:33,217 - utils.training_utils - INFO - Early stopping triggered
+2026-02-03 08:56:11,400 - utils.training_utils - INFO - Random seed set to 42
+2026-02-03 08:56:11,400 - relbdata.adapter - INFO - Loading RelBench dataset: trial (Local/Docker Mode)
+2026-02-03 08:56:11,400 - relbdata.adapter - INFO - Found local tasks directory at: /home/wzzhao/.cache/relbench/rel-trial/tasks
+2026-02-03 08:56:11,427 - relbdata.adapter - INFO - Loaded tasks from local storage: ['study-outcome', 'site-success', 'study-adverse']
+2026-02-03 08:56:15,014 - relbdata.adapter - INFO - Building temporal heterogeneous graph with HIGH-RES features...
+2026-02-03 08:56:26,637 - relbdata.adapter - INFO - Graph built: 5434924 nodes, 15335102 edges
+2026-02-03 08:56:50,752 - utils.training_utils - INFO - Created adamw optimizer, lr=0.0003
+2026-02-03 08:56:50,752 - utils.training_utils - INFO - Created cosine learning-rate scheduler
+2026-02-03 08:56:50,752 - __mp_main__ - INFO - Starting DDP training loop...
+2026-02-03 09:12:05,699 - utils.training_utils - INFO - Random seed set to 42
+2026-02-03 09:12:05,699 - relbdata.adapter - INFO - Loading RelBench dataset: trial (Local/Docker Mode)
+2026-02-03 09:12:05,699 - relbdata.adapter - INFO - Found local tasks directory at: /home/wzzhao/.cache/relbench/rel-trial/tasks
+2026-02-03 09:12:05,726 - relbdata.adapter - INFO - Loaded tasks from local storage: ['study-outcome', 'site-success', 'study-adverse']
+2026-02-03 09:12:09,249 - relbdata.adapter - INFO - Building temporal heterogeneous graph with HIGH-RES features...
+2026-02-03 09:12:20,745 - relbdata.adapter - INFO - Graph built: 5434924 nodes, 15335102 edges
+2026-02-03 09:12:23,839 - utils.training_utils - INFO - Created adamw optimizer, lr=0.0003
+2026-02-03 09:12:23,839 - utils.training_utils - INFO - Created cosine learning-rate scheduler
+2026-02-03 09:12:23,839 - __mp_main__ - INFO - Starting DDP training loop...
+2026-02-03 09:17:29,609 - __mp_main__ - INFO - Epoch 1: Train Loss 0.6670, Val Loss 0.6870
+2026-02-03 09:22:47,222 - __mp_main__ - INFO - Epoch 2: Train Loss 0.6595, Val Loss 0.6924
+2026-02-03 09:22:47,222 - utils.training_utils - INFO - EarlyStopping counter: 1 out of 15
+2026-02-03 09:27:56,677 - __mp_main__ - INFO - Epoch 3: Train Loss 0.6576, Val Loss 0.6815
+2026-02-03 09:32:35,089 - utils.training_utils - INFO - Random seed set to 42
+2026-02-03 09:32:35,089 - relbdata.adapter - INFO - Loading RelBench dataset: trial (Local/Docker Mode)
+2026-02-03 09:32:35,089 - relbdata.adapter - INFO - Found local tasks directory at: /home/wzzhao/.cache/relbench/rel-trial/tasks
+2026-02-03 09:32:35,115 - relbdata.adapter - INFO - Loaded tasks from local storage: ['study-outcome', 'site-success', 'study-adverse']
+2026-02-03 09:32:38,793 - relbdata.adapter - INFO - Building temporal heterogeneous graph with HIGH-RES features...
+2026-02-03 09:32:51,233 - relbdata.adapter - INFO - Graph built: 5434924 nodes, 15335102 edges
+2026-02-03 09:33:24,299 - utils.training_utils - INFO - Created adamw optimizer, lr=0.0003
+2026-02-03 09:33:24,299 - utils.training_utils - INFO - Created cosine learning-rate scheduler
+2026-02-03 09:33:24,299 - __mp_main__ - INFO - Starting DDP training loop...
+2026-02-03 09:39:22,689 - utils.training_utils - INFO - Random seed set to 42
+2026-02-03 09:39:22,690 - relbdata.adapter - INFO - Loading RelBench dataset: trial (Local/Docker Mode)
+2026-02-03 09:39:22,690 - relbdata.adapter - INFO - Found local tasks directory at: /home/wzzhao/.cache/relbench/rel-trial/tasks
+2026-02-03 09:39:22,717 - relbdata.adapter - INFO - Loaded tasks from local storage: ['study-outcome', 'site-success', 'study-adverse']
+2026-02-03 09:39:26,328 - relbdata.adapter - INFO - Building temporal heterogeneous graph with DIAGNOSTIC features...
+2026-02-03 09:39:39,805 - relbdata.adapter - INFO - Graph built: 5434924 nodes, 15335102 edges
+2026-02-03 09:44:11,728 - utils.training_utils - INFO - Random seed set to 42
+2026-02-03 09:44:11,728 - relbdata.adapter - INFO - Loading RelBench dataset: trial (Local/Docker Mode)
+2026-02-03 09:44:11,728 - relbdata.adapter - INFO - Found local tasks directory at: /home/wzzhao/.cache/relbench/rel-trial/tasks
+2026-02-03 09:44:15,475 - relbdata.adapter - INFO - Building temporal heterogeneous graph with SCALED features...
+2026-02-03 09:44:28,390 - relbdata.adapter - INFO - Graph built: 5434924 nodes, 15335102 edges
+2026-02-03 09:44:30,180 - __mp_main__ - ERROR - Error loading trial: 'NoneType' object is not subscriptable
+2026-02-03 09:51:43,554 - utils.training_utils - INFO - Random seed set to 42
+2026-02-03 09:51:43,554 - relbdata.adapter - INFO - Loading RelBench dataset: trial (Local/Docker Mode)
+2026-02-03 09:51:43,554 - relbdata.adapter - INFO - Found local tasks directory at: /home/wzzhao/.cache/relbench/rel-trial/tasks
+2026-02-03 09:51:43,564 - relbdata.adapter - INFO -   -> Registered local task: study-outcome
+2026-02-03 09:51:43,573 - relbdata.adapter - INFO -   -> Registered local task: site-success
+2026-02-03 09:51:43,576 - relbdata.adapter - INFO -   -> Registered local task: study-adverse
+2026-02-03 09:51:47,194 - relbdata.adapter - INFO - Building temporal heterogeneous graph with SCALED features...
+2026-02-03 09:51:59,514 - relbdata.adapter - INFO - Graph built: 5434924 nodes, 15335102 edges
+2026-02-03 09:52:14,305 - utils.training_utils - INFO - Created adamw optimizer, lr=0.0003
+2026-02-03 09:52:14,305 - utils.training_utils - INFO - Created cosine learning-rate scheduler
+2026-02-03 09:52:14,305 - __mp_main__ - INFO - Starting DDP training loop...

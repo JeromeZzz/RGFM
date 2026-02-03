@@ -1,6 +1,7 @@
+
 """
-KumoRFM Main Model - Raw Feature Probe Mode
-(Checking Feature Sim BEFORE Positional Encoding)
+KumoRFM Main Model - Deep Diagnostic Mode
+(Includes Cosine Similarity & Label Correlation Checks)
 """
 import torch
 import torch.nn as nn
@@ -23,22 +24,23 @@ logger = logging.getLogger(__name__)
 
 # --- DEBUG UTILS ---
 def debug_tensor_stats(name, tensor):
-    if tensor.numel() == 0: return f"{name}: EMPTY"
-    return f"{name}: Shape={list(tensor.shape)} | Mean={tensor.mean().item():.4f} | Std={tensor.std().item():.4f}"
+    if tensor.numel() == 0:
+        return f"{name}: EMPTY"
+    return f"{name}: Shape={list(tensor.shape)} | Mean={tensor.mean().item():.4f} | Std={tensor.std().item():.4f} | Min={tensor.min().item():.4f} | Max={tensor.max().item():.4f}"
 
-def check_feature_diversity(name, embs):
-    # Check pairwise similarity within batch
-    if embs.shape[0] < 2: return f"{name}: Not enough samples"
+def check_feature_quality(ctx_embs, test_embs):
+    # ctx_embs: [B, N_ctx, D]
+    # test_embs: [B, D]
     
-    norm = F.normalize(embs, p=2, dim=1)
-    sim = torch.mm(norm, norm.t())
-    mask = torch.eye(sim.size(0), device=sim.device).bool()
-    avg_sim = sim[~mask].mean().item()
+    # 1. Cosine Sim between Test and Context Average
+    ctx_mean = ctx_embs.mean(dim=1) # [B, D]
+    cos_sim = F.cosine_similarity(ctx_mean, test_embs, dim=-1).mean().item()
     
-    log = f"  [{name} DIVERSITY]\n"
-    log += f"  -> Avg CosSim: {avg_sim:.4f} (Should be < 0.5)\n"
-    if avg_sim > 0.8: log += "  -> [WARNING] Features are extremely SIMILAR!\n"
-    return log
+    # 2. Embedding Norms
+    test_norm = test_embs.norm(dim=-1).mean().item()
+    ctx_norm = ctx_embs.norm(dim=-1).mean().item()
+    
+    return f"  -> CosSim(Ctx, Test): {cos_sim:.4f} (Should be > 0.1 and < 0.9)\n  -> Test Norm: {test_norm:.4f}, Ctx Norm: {ctx_norm:.4f}"
 
 # -------------------
 
@@ -48,7 +50,7 @@ class NeighborNodeTypeEncoder(nn.Module):
         num_types = (max(node_type_map.values()) + 1) if node_type_map else 5000
         safe_num = max(num_types, 5000)
         self.embedding = nn.Embedding(safe_num, embedding_dim)
-        nn.init.orthogonal_(self.embedding.weight)
+        self.num_embeddings = safe_num
     def forward(self, x):
         return self.embedding(x.clamp(max=self.embedding.num_embeddings-1))
 
@@ -56,7 +58,6 @@ class NeighborHopEncoder(nn.Module):
     def __init__(self, max_hop, dim):
         super().__init__()
         self.embedding = nn.Embedding(max_hop + 10, dim)
-        nn.init.orthogonal_(self.embedding.weight)
     def forward(self, x): 
         return self.embedding((x+1).clamp(0, self.embedding.num_embeddings-1))
 
@@ -64,10 +65,6 @@ class NeighborTimeEncoder(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
-        self.project = nn.Linear(dim, dim)
-        nn.init.normal_(self.project.weight, std=0.01)
-        nn.init.zeros_(self.project.bias)
-
     def forward(self, rel_time):
         device = rel_time.device
         if rel_time.dim() == 1: rel_time = rel_time.unsqueeze(0).unsqueeze(-1)
@@ -78,7 +75,7 @@ class NeighborTimeEncoder(nn.Module):
         sinus = torch.zeros(pos.shape[0], pos.shape[1], self.dim, device=device)
         sinus[..., 0::2] = torch.sin(pos * div[0::2])
         sinus[..., 1::2] = torch.cos(pos * div[:self.dim//2])
-        return self.project(sinus)
+        return sinus
 
 class KumoRFM(nn.Module):
     def __init__(self, config: KumoRFMConfig, database_schema: Dict):
@@ -92,6 +89,8 @@ class KumoRFM(nn.Module):
         
         self.backward_sampler = None
         self.context_sampler = None
+        
+        # [DEBUG] Flag to print once
         self.has_printed_debug = False
 
         self._init_encoders()
@@ -99,8 +98,6 @@ class KumoRFM(nn.Module):
         self.icl_module = ICLModule(config)
         self.dual_context = DualContextMechanism(config)
         self._register_heads()
-        
-        self.feature_norm = nn.LayerNorm(config.hidden_dim)
         
         self.global_max_dim = 2 
 
@@ -203,14 +200,15 @@ class KumoRFM(nn.Module):
         else:
             ctx_embs = torch.zeros(batch_size, 0, self.config.hidden_dim, device=device)
 
-        # --- [DIAGNOSTIC LOGIC] ---
+        # --- [CRITICAL DIAGNOSTICS] ---
         if not self.has_printed_debug and ctx_embs.size(1) > 0:
             print("\n" + "="*60)
-            print(" [DIAGNOSTIC] Final Logic Analysis")
+            print(" [DIAGNOSTIC] First Forward Pass Analysis")
             print("="*60)
-            # Check final embedding diversity
-            print(check_feature_diversity("Final Test Emb", test_embs))
-            
+            print(debug_tensor_stats("Test Embeddings", test_embs))
+            print(debug_tensor_stats("Context Embeddings", ctx_embs))
+            print(check_feature_quality(ctx_embs, test_embs))
+            print("="*60 + "\n")
             self.has_printed_debug = True
         # ------------------------------
 
@@ -300,8 +298,6 @@ class KumoRFM(nn.Module):
         nt_offsets = {nt: 0 for nt in big_enc.keys()}
         giant_tokens, giant_nt, giant_ei, giant_et, tgt_indices, curr_off = [], [], [], [], [], 0
         
-        raw_feat_probe = [] # To store raw features before summing PE
-
         for i, sub in enumerate(subgraphs):
             g_f, g_t, g_map, g_c = [], [], {}, 0
             
@@ -328,13 +324,6 @@ class KumoRFM(nn.Module):
             tokens = torch.cat(g_f, dim=0)
             nt_tsr = torch.tensor(g_t, device=device)
             
-            # --- [PROBE] Check Raw Feature Diversity (First graph only) ---
-            if i == 0 and not self.has_printed_debug:
-                raw_feat_probe = tokens
-                print("\n  [DIAGNOSTIC] Feature Before RelGT & PE")
-                print(check_feature_diversity("Raw Tokens (Graph 0)", raw_feat_probe))
-            # --------------------------------------------------------
-
             edges, ets = [], []
             for idx, et in enumerate(sub.edge_types):
                 if et in sub.edge_indices:
@@ -362,13 +351,7 @@ class KumoRFM(nn.Module):
             hop = self._get_hop_distances(sub, target_entities[i], g_map).to(device)
             time = self._get_time_differences(sub, ts_val, g_map, scale_to_days=True).to(device)
             
-            tokens = self.feature_norm(tokens)
-            
-            t_emb = self.relgt_type_encoder(nt_tsr)
-            h_emb = self.relgt_hop_encoder(hop)
-            tm_emb = self.relgt_time_encoder(time.unsqueeze(0).float()).squeeze(0)
-            
-            tokens = tokens + t_emb + h_emb + tm_emb
+            tokens = tokens + self.relgt_type_encoder(nt_tsr) + self.relgt_hop_encoder(hop) + self.relgt_time_encoder(time.unsqueeze(0).float()).squeeze(0)
             
             t_type, _ = target_entities[i]
             t_local_id = getattr(sub, 'target_local_index', 0) 
@@ -403,7 +386,6 @@ class KumoRFM(nn.Module):
         )
         return out_all[torch.tensor(tgt_indices, device=device)]
 
-    # ... (rest of methods)
     def _run_icl_vectorized(self, ctx_embs, ctx_labels, test_emb, task_type):
         label_emb = self.icl_module.label_encoder(ctx_labels, task_type, device=ctx_embs.device)
         full_ctx = ctx_embs + label_emb

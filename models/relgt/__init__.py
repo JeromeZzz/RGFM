@@ -2,6 +2,6 @@
 RelGT集成模块
 """
 
-from .relgt_model import RelGTAdapter
+from .relgt_model import RelGTWrapper
 
-__all__ = ['RelGTAdapter']
+__all__ = ['RelGTWrapper']

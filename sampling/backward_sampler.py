@@ -1,7 +1,8 @@
+
 """
 后向子图采样器
 用于构建预测时的输入特征子图
-(Fix: Ensure timezone-aware datetime generation)
+(Fix: Ensure timezone-aware datetime generation & Target Local Index Tracking)
 """
 
 import torch
@@ -89,7 +90,6 @@ class BackwardSubgraphSampler:
 
                     for neighbor_id, timestamp in neighbor_list:
                         # 检查时间约束
-                        # Ensure comparison handles timezone awareness by normalizing if needed
                         if self._is_future(timestamp, prediction_time):
                             continue
 
@@ -116,8 +116,8 @@ class BackwardSubgraphSampler:
                 if total_nodes >= max_nodes:
                     break
 
-        # 构建子图
-        subgraph = self._build_subgraph(graph, sampled_nodes, sampled_edges, hop_distances)
+        # 构建子图 (传入 target_entity 以锁定局部索引)
+        subgraph = self._build_subgraph(graph, sampled_nodes, sampled_edges, hop_distances, target_entity)
 
         return subgraph
 
@@ -129,9 +129,6 @@ class BackwardSubgraphSampler:
                           max_neighbors: int) -> Dict[Tuple[str, str, str], List[Tuple[int, datetime]]]:
         """
         采样单个节点的邻居
-
-        Returns:
-            {edge_type: [(neighbor_id, timestamp)]}
         """
         neighbors = defaultdict(list)
 
@@ -148,7 +145,6 @@ class BackwardSubgraphSampler:
             if edge_type in graph.edge_timestamps:
                 edge_timestamps = graph.edge_timestamps[edge_type]
             else:
-                # 如果没有时间戳，使用默认时间 (0.0)
                 edge_timestamps = torch.zeros(edge_index.shape[1])
 
             # 根据边的方向采样
@@ -159,7 +155,6 @@ class BackwardSubgraphSampler:
                 valid_timestamps = edge_timestamps[mask]
 
                 # 时间过滤
-                # Use timestamp float comparison to avoid datetime issues here
                 pred_ts_float = self._datetime_to_timestamp(prediction_time)
                 time_mask = valid_timestamps <= pred_ts_float
                 
@@ -214,26 +209,18 @@ class BackwardSubgraphSampler:
                                  timestamps: torch.Tensor,
                                  prediction_time: datetime,
                                  max_neighbors: int) -> List[int]:
-        """
-        应用采样策略
-        """
         if len(neighbors) <= max_neighbors:
             return list(range(len(neighbors)))
 
         if self.strategy == 'random':
-            # 随机采样
             indices = torch.randperm(len(neighbors))[:max_neighbors]
             return indices.tolist()
 
         elif self.strategy == 'temporal_importance':
-            # 基于时间重要性采样
             pred_timestamp = self._datetime_to_timestamp(prediction_time)
             time_diffs = pred_timestamp - timestamps
-
-            # 计算时间衰减权重
             weights = torch.exp(-time_diffs * self.time_decay_factor)
 
-            # 加权采样
             if torch.sum(weights) > 0:
                 probs = weights / torch.sum(weights)
                 indices = torch.multinomial(probs, max_neighbors, replacement=False)
@@ -242,35 +229,41 @@ class BackwardSubgraphSampler:
                 return torch.randperm(len(neighbors))[:max_neighbors].tolist()
 
         elif self.strategy == 'structure_aware':
-            # 基于结构重要性采样（这里简化为度数）
             return torch.randperm(len(neighbors))[:max_neighbors].tolist()
 
         else:
-            # 默认随机采样
             return torch.randperm(len(neighbors))[:max_neighbors].tolist()
 
     def _build_subgraph(self,
                         original_graph: TemporalHeterogeneousGraph,
                         sampled_nodes: Dict[str, Set[int]],
                         sampled_edges: Dict[Tuple[str, str, str], List[Tuple[int, int, datetime]]],
-                        hop_distances: Dict[str, Dict[int, int]]) -> TemporalHeterogeneousGraph:
+                        hop_distances: Dict[str, Dict[int, int]],
+                        target_entity: Tuple[str, int]) -> TemporalHeterogeneousGraph:
         """
-        构建采样后的子图
+        构建采样后的子图，并追踪目标节点的局部索引
         """
         subgraph = TemporalHeterogeneousGraph()
+        target_type, target_global_id = target_entity
 
         # 创建节点ID映射
         node_id_mapping = {}
+        target_local_index = 0 # Default
 
         # 添加节点
         for node_type, node_ids in sampled_nodes.items():
+            # [CRITICAL] Sorting ensures deterministic local IDs
             node_ids = sorted(list(node_ids))
             num_nodes = len(node_ids)
 
-            # 创建ID映射
+            # 创建ID映射: Global ID -> Local ID
             node_id_mapping[node_type] = {
                 old_id: new_id for new_id, old_id in enumerate(node_ids)
             }
+            
+            # [FIX] Check if target is in this type, and get its local ID
+            if node_type == target_type and target_global_id in node_id_mapping[node_type]:
+                target_local_index = node_id_mapping[node_type][target_global_id]
 
             # 获取节点特征
             if node_type in original_graph.node_features:
@@ -288,7 +281,7 @@ class BackwardSubgraphSampler:
 
             subgraph.add_node_type(node_type, num_nodes, features, timestamps)
 
-            # 存储跳数信息作为额外属性
+            # 存储跳数信息
             hop_tensor = torch.zeros(num_nodes, dtype=torch.long)
             for old_id, new_id in node_id_mapping[node_type].items():
                 hop_tensor[new_id] = hop_distances[node_type].get(old_id, -1)
@@ -301,8 +294,6 @@ class BackwardSubgraphSampler:
                 continue
 
             source_type, edge_name, target_type = edge_type
-
-            # 转换边索引
             new_edge_index = []
             new_timestamps = []
 
@@ -319,24 +310,18 @@ class BackwardSubgraphSampler:
 
                 subgraph.add_edge_type(edge_name, (source_type, target_type),
                                        edge_index, timestamps)
-
+        
+        # [FIX] Store the mapped local index in the subgraph object
+        subgraph.target_local_index = target_local_index
         return subgraph
 
     def _datetime_to_timestamp(self, dt: datetime) -> float:
-        """将datetime转换为时间戳"""
         return dt.timestamp()
 
     def _timestamp_to_datetime(self, ts: float) -> datetime:
-        """
-        将时间戳转换为datetime (UTC-Aware)
-        Fix: 使用 timezone.utc 确保生成的 datetime 带有时区信息，
-        以便与 adapter.py 生成的 prediction_time (UTC) 进行比较。
-        """
         return datetime.fromtimestamp(ts, tz=timezone.utc)
 
     def _is_future(self, ts1: datetime, ts2: datetime) -> bool:
-        """Safe comparison handling mixed naive/aware datetimes"""
-        # If mismatch, convert naive to aware (UTC)
         if ts1.tzinfo is None and ts2.tzinfo is not None:
             ts1 = ts1.replace(tzinfo=timezone.utc)
         elif ts1.tzinfo is not None and ts2.tzinfo is None:

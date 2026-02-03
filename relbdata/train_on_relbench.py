@@ -1,6 +1,8 @@
+
 """
-Train KumoRFM on RelBench datasets
-(Fixed: Variable Scoping, Initialization, and Robust Stats)
+# -*- coding: utf-8 -*-
+Train KumoRFM on RelBench datasets - DEBUG PROBES
+(Monitoring Gradients, Logits, and Signal-to-Noise Ratio)
 """
 
 import argparse
@@ -11,7 +13,6 @@ import torch.multiprocessing as mp
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
-from torch.utils.data import RandomSampler, SequentialSampler
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -24,13 +25,7 @@ import time
 import warnings
 from typing import Dict, Any, List
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
-from sklearn.metrics import roc_auc_score, mean_absolute_error, accuracy_score
-
-try:
-    import torch_frame
-    from torch_frame.data.stats import StatType
-except ImportError:
-    sys.exit("[ERROR] pytorch-frame missing")
+import torch.nn.functional as F
 
 import torch.multiprocessing
 try:
@@ -58,56 +53,40 @@ from data.temporal_graph import TemporalHeterogeneousGraph
 
 logger = logging.getLogger(__name__)
 
+# --- GLOBAL REGISTRY ---
 TASK_CONFIG_REGISTRY: List[TaskConfig] = []
 DATASET_NAME_REGISTRY: List[str] = []
 NODE_TYPE_REGISTRY: List[str] = []
 
 def get_registry_id(registry: List, item: Any) -> int:
-    try: return registry.index(item)
+    try: 
+        return registry.index(item)
     except ValueError:
         registry.append(item)
         return len(registry) - 1
 
-def compute_heuristic_col_stats(schema):
-    stats = {}
-    current_ts = float(time.time())
-    
-    median_key = getattr(StatType, 'MEDIAN_TIMESTAMP', getattr(StatType, 'MEDIAN_TIME', getattr(StatType, 'MEDIAN', StatType.MEAN)))
-    year_range_key = getattr(StatType, 'YEAR_RANGE', None)
-
-    for table, cols in schema.items():
-        stats[table] = {}
-        for col, dtype in cols.items():
-            s_dtype = str(dtype).lower()
-            if 'float' in s_dtype or 'int' in s_dtype or 'numerical' in s_dtype:
-                stats[table][col] = {StatType.MEAN: 0.0, StatType.STD: 1.0}
-            elif 'time' in s_dtype or 'date' in s_dtype:
-                ts_stats = {}
-                ts_stats[median_key] = current_ts
-                if year_range_key: ts_stats[year_range_key] = [2000, 2030]
-                ts_stats[StatType.MEAN] = current_ts
-                ts_stats[StatType.STD] = 1.0
-                stats[table][col] = ts_stats
-            else:
-                dummy_vocab = [str(i) for i in range(10)]
-                dummy_counts = [1] * 10
-                stats[table][col] = {StatType.COUNT: (dummy_vocab, dummy_counts)}
-    return stats
-
-def make_graph_shared(graph):
+def make_graph_shared(graph: TemporalHeterogeneousGraph):
     for nt in graph.node_features:
         if graph.node_features[nt] is not None: graph.node_features[nt].share_memory_()
     for nt in graph.node_timestamps:
         if graph.node_timestamps[nt] is not None: graph.node_timestamps[nt].share_memory_()
     for et in graph.edge_indices:
         graph.edge_indices[et].share_memory_()
+        if et in graph.edge_timestamps and graph.edge_timestamps[et] is not None:
+            graph.edge_timestamps[et].share_memory_()
     return graph
 
 class RelBenchDataset(Dataset):
     def __init__(self, entities, labels, timestamps, task_config, dataset_name, 
-                 graph, backward_sampler, context_sampler, node_type_registry, 
+                 graph: TemporalHeterogeneousGraph, 
+                 backward_sampler: BackwardSubgraphSampler,
+                 context_sampler: ContextSampler,
+                 node_type_registry: List[str], 
+                 dst_entities=None, 
                  num_hops=2, max_neighbors=10, num_context=5, context_strategy='mixed'):
+        
         self.entities = entities
+        self.dst_entities = dst_entities
         self.timestamps = timestamps
         self.task_config = task_config
         self.dataset_name = dataset_name
@@ -136,7 +115,7 @@ class RelBenchDataset(Dataset):
             _, inverse = np.unique(labels_str, return_inverse=True)
             self.labels = torch.tensor(inverse, dtype=torch.long)
         elif task_config.task_type == 'link_prediction':
-            self.labels = torch.tensor(labels_array.astype(float), dtype=torch.float)
+             self.labels = torch.tensor(labels_array.astype(float), dtype=torch.float)
         else:
             raw_y = pd.to_numeric(pd.Series(labels_array.reshape(-1)), errors='coerce').fillna(0.0).values
             raw_y = torch.tensor(raw_y, dtype=torch.float)
@@ -149,19 +128,39 @@ class RelBenchDataset(Dataset):
         node_id = self.ent_node_ids[idx]
         ts_float = self.timestamps[idx].timestamp()
         node_type = self.node_type_registry[nt_id]
+        
         target_ent = (node_type, node_id)
         ts = self.timestamps[idx]
+        
         test_subgraph = self.backward_sampler.sample(
             self.graph, target_ent, ts, self.num_hops, self.max_neighbors
         )
+        
+        test_dst_subgraph = None
+        target_dst_ent = None
+        if self.dst_entities:
+            target_dst_ent = self.dst_entities[idx] 
+            test_dst_subgraph = self.backward_sampler.sample(
+                self.graph, target_dst_ent, ts, self.num_hops, self.max_neighbors
+            )
+        
         ctx_exs = self.context_sampler.sample_context(
             self.graph, target_ent, ts, self.task_config, 
             self.num_context, strategy=self.context_strategy
         )
+        
         return {
-            'ds_id': self.ds_id, 'nt_id': nt_id, 'node_id': node_id, 'ts': ts_float,
-            'task_id': self.task_id, 'label': self.labels[idx],
-            'test_subgraph': test_subgraph, 'target_ent': target_ent, 'ctx_exs': ctx_exs
+            'ds_id': self.ds_id,
+            'nt_id': nt_id,
+            'node_id': node_id,
+            'ts': ts_float,
+            'task_id': self.task_id,
+            'label': self.labels[idx],
+            'test_subgraph': test_subgraph,
+            'target_ent': target_ent,
+            'test_dst_subgraph': test_dst_subgraph,
+            'target_dst_ent': target_dst_ent,
+            'ctx_exs': ctx_exs
         }
 
 def collate_fn(batch):
@@ -174,6 +173,8 @@ def collate_fn(batch):
         'labels': torch.stack([b['label'] for b in batch]),
         'test_subgraphs': [b['test_subgraph'] for b in batch],
         'target_ents': [b['target_ent'] for b in batch],
+        'test_dst_subgraphs': [b['test_dst_subgraph'] for b in batch] if batch[0]['test_dst_subgraph'] else None,
+        'target_dst_ents': [b['target_dst_ent'] for b in batch] if batch[0]['target_dst_ent'] else None,
         'ctx_exs_list': [b['ctx_exs'] for b in batch]
     }
 
@@ -190,53 +191,63 @@ def apply_dataset_prefix(graph, schema, ds_name):
         new_graph.add_edge_type(new_et[1], (new_et[0], new_et[2]), graph.edge_indices[et], graph.edge_timestamps.get(et))
     return new_graph, new_schema
 
-def setup_logger(rank, log_dir):
-    root = logging.getLogger()
-    if root.hasHandlers(): root.handlers.clear()
-    fmt = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    sh = logging.StreamHandler(); sh.setFormatter(fmt); sh.setLevel(logging.INFO)
-    root.addHandler(sh)
-    if rank == 0: root.setLevel(logging.DEBUG)
-    else: root.setLevel(logging.ERROR)
+def setup_logger(rank, log_dir=None):
+    root_logger = logging.getLogger()
+    if root_logger.hasHandlers(): root_logger.handlers.clear()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(logging.INFO)
+    root_logger.addHandler(console_handler)
+    if rank == 0 and log_dir:
+        path = Path(log_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(path / "training.log")
+        file_handler.setFormatter(formatter)
+        file_handler.setLevel(logging.INFO)
+        root_logger.addHandler(file_handler)
+    if rank == 0: root_logger.setLevel(logging.INFO) 
+    else: root_logger.setLevel(logging.ERROR)
 
-def verify_device_compatibility(device):
-    if device.type == 'cpu': return True
-    try:
-        t = torch.ones(1, device=device)
-        _ = t + t
-        return True
-    except RuntimeError: return False
+def check_gradients(model):
+    total_norm = 0.0
+    has_grad = False
+    for p in model.parameters():
+        if p.grad is not None:
+            param_norm = p.grad.data.norm(2)
+            total_norm += param_norm.item() ** 2
+            has_grad = True
+    total_norm = total_norm ** 0.5
+    return total_norm, has_grad
 
 class RelBenchTrainer:
-    def __init__(self, model, config, exp_config, device, rank, is_distributed=False):
+    def __init__(self, model, config, exp_config, device, rank):
         self.model = model
         self.config = config
         self.exp_config = exp_config
         self.device = device
         self.rank = rank 
-        self.is_distributed = is_distributed
         self.base_trainer = KumoRFMTrainer(model, config, exp_config, device)
         self.cls_criterion = nn.CrossEntropyLoss()
         self.reg_criterion = nn.MSELoss()
+        self.bce_criterion = nn.BCEWithLogitsLoss()
 
     def train(self, train_loader, val_loader):
+        if self.rank == 0: logger.info("Starting DDP training loop...")
         best_val_loss = float('inf')
         for epoch in range(self.exp_config.num_epochs):
-            if self.is_distributed and hasattr(train_loader, 'sampler') and hasattr(train_loader.sampler, 'set_epoch'):
+            if hasattr(train_loader, 'sampler') and hasattr(train_loader.sampler, 'set_epoch'):
                 train_loader.sampler.set_epoch(epoch)
-            
-            train_loss = self._run_epoch(train_loader, epoch, True)
-            val_loss = 0.0
-            if val_loader:
-                if self.device.type == 'cuda': torch.cuda.empty_cache()
-                val_loss = self._run_epoch(val_loader, epoch, False)
-            
+            train_loss = self._run_epoch(train_loader, epoch, is_train=True)
+            if val_loader and len(val_loader) > 0:
+                torch.cuda.empty_cache()
+                val_loss = self._run_epoch(val_loader, epoch, is_train=False)
+            else: val_loss = 0.0
             if self.rank == 0:
-                logger.info(f"Epoch {epoch+1}: Train {train_loss:.4f}, Val {val_loss:.4f}")
+                logger.info(f"Epoch {epoch+1}: Train Loss {train_loss:.4f}, Val Loss {val_loss:.4f}")
                 if val_loss < best_val_loss and val_loader:
                     best_val_loss = val_loss
                     self._save_checkpoint(epoch, val_loss)
-            
             if self.base_trainer.early_stopping(val_loss): break
 
     def _run_epoch(self, loader, epoch, is_train):
@@ -244,11 +255,10 @@ class RelBenchTrainer:
         else: self.model.eval()
         total_loss = torch.tensor(0.0, device=self.device)
         steps = torch.tensor(0.0, device=self.device)
+        context = torch.enable_grad() if is_train else torch.no_grad()
         
-        ctx = torch.enable_grad() if is_train else torch.no_grad()
-        with ctx:
-            iterable = tqdm(loader, desc=f"Epoch {epoch+1}", disable=(self.rank != 0))
-            for batch in iterable:
+        with context:
+            for i, batch in enumerate(tqdm(loader) if self.rank==0 else loader):
                 ds_ids = batch['ds_ids'].to(self.device, non_blocking=True)
                 nt_ids = batch['nt_ids'].to(self.device, non_blocking=True)
                 node_ids = batch['node_ids'].to(self.device, non_blocking=True)
@@ -258,30 +268,40 @@ class RelBenchTrainer:
                 
                 if is_train: self.base_trainer.optimizer.zero_grad()
 
-                out = self.model(
-                    dataset_ids=ds_ids, entity_type_ids=nt_ids, entity_ids=node_ids,
-                    timestamps=ts, task_config_ids=task_ids,
+                output = self.model(
+                    dataset_ids=ds_ids, 
+                    entity_type_ids=nt_ids, 
+                    entity_ids=node_ids,
+                    timestamps=ts, 
+                    task_config_ids=task_ids,
                     test_subgraphs=batch['test_subgraphs'],
                     target_ents=batch['target_ents'],
-                    ctx_exs_list=batch['ctx_exs_list']
+                    ctx_exs_list=batch['ctx_exs_list'],
+                    test_dst_subgraphs=batch['test_dst_subgraphs'], 
+                    target_dst_ents=batch['target_dst_ents']
                 )
-                preds = out['predictions']
+                preds = output['predictions']
                 loss = torch.tensor(0.0, device=self.device)
                 valid = 0
-                for tid in torch.unique(task_ids):
+                unique_tasks = torch.unique(task_ids)
+                
+                for tid in unique_tasks:
                     mask = (task_ids == tid)
                     sub_pred = preds[mask]
-                    sub_lbl = labels[mask]
+                    sub_label = labels[mask]
                     t_conf = TASK_CONFIG_REGISTRY[tid.item()]
                     
                     if t_conf.task_type == 'classification':
+                        sub_label = sub_label.long()
                         if sub_pred.shape[-1] > t_conf.num_classes:
                             sub_pred = sub_pred[:, :t_conf.num_classes]
-                        l = self.cls_criterion(sub_pred, sub_lbl.long())
+                        l = self.cls_criterion(sub_pred, sub_label)
                     elif t_conf.task_type == 'link_prediction':
-                        l = torch.nn.functional.binary_cross_entropy_with_logits(sub_pred[:,0], sub_lbl.float())
+                        l = self.bce_criterion(sub_pred[:, 0], sub_label.float())
                     else:
-                        l = self.reg_criterion(sub_pred[:,0], sub_lbl.view(-1))
+                        reg_pred = sub_pred[:, 0]
+                        sub_label = sub_label.view_as(reg_pred)
+                        l = self.reg_criterion(reg_pred, sub_label) * 0.1
                     
                     loss += l * mask.sum()
                     valid += mask.sum()
@@ -290,153 +310,178 @@ class RelBenchTrainer:
                     loss = loss / valid
                     if is_train:
                         loss.backward()
+                        
+                        # [PROBE 1] Check Gradient Norm
+                        grad_norm, has_grad = check_gradients(self.model)
+                        if self.rank == 0 and i % 20 == 0:
+                            pred_mean = preds.mean().item()
+                            pred_std = preds.std().item()
+                            label_mean = labels.float().mean().item()
+                            # Replaced special char with standard ASCII
+                            print(f"\n[STEP {i}] Loss: {loss.item():.4f} | GradNorm: {grad_norm:.4f} | Pred: {pred_mean:.2f}+/-{pred_std:.2f} | Label: {label_mean:.2f}")
+                            if not has_grad:
+                                print(" [WARNING] No gradients computed! Check graph disconnects.")
+                            if grad_norm > 100:
+                                print(" [WARNING] Exploding Gradients!")
+
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                         self.base_trainer.optimizer.step()
                         self.base_trainer.scheduler.step()
                     total_loss += loss.item()
                     steps += 1.0
-        
-        if self.is_distributed:
-            dist.all_reduce(total_loss); dist.all_reduce(steps)
+
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(steps, op=dist.ReduceOp.SUM)
         return (total_loss / max(1.0, steps)).item()
 
     def _save_checkpoint(self, epoch, metric):
-        model_state = self.model.module.state_dict() if self.is_distributed else self.model.state_dict()
         path = Path(self.exp_config.save_dir) / 'best_model.pt'
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({'epoch': epoch, 'model': model_state}, path)
+        state = self.model.module.state_dict()
+        torch.save({'epoch': epoch, 'model': state}, path)
 
 def ddp_setup(rank, world_size):
-    if world_size > 1:
-        os.environ['MASTER_ADDR'] = 'localhost'; os.environ['MASTER_PORT'] = '29509'
-        dist.init_process_group("nccl", rank=rank, world_size=world_size)
-        torch.cuda.set_device(rank)
-    else:
-        if torch.cuda.is_available(): torch.cuda.set_device(rank)
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '29506' 
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
 
-def ddp_cleanup(world_size):
-    if world_size > 1: dist.destroy_process_group()
+def ddp_cleanup():
+    dist.destroy_process_group()
 
 def main_worker(rank, world_size, args):
     ddp_setup(rank, world_size)
     setup_logger(rank, args.output_dir)
-    
-    device_candidate = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
-    if device_candidate.type == 'cuda' and not verify_device_compatibility(device_candidate):
-        if rank == 0: logger.warning("CUDA incompatible (RTX 5090 vs PyTorch). Fallback to CPU.")
-        device = torch.device("cpu")
-    else:
-        device = device_candidate
-    
-    set_random_seed(42 + rank)
+    device = torch.device(f"cuda:{rank}")
+    set_random_seed(42 + rank) 
 
-    str_graph_map = {}
+    str_graph_map = {} 
     combined_schema = {}
     target_ds = ['amazon','stack','f1','trial','avito','event','hm'] if args.dataset == 'ALL' else args.dataset.split(',')
     
-    samp_conf = SamplingConfig(num_hops=args.num_hops, max_neighbors=args.max_neighbors, max_neighbors_per_hop=[args.max_neighbors]*args.num_hops)
+    sampling_config = SamplingConfig(num_hops=args.num_hops, max_neighbors=args.max_neighbors)
     label_table = InContextLabelTable()
     fwd_sampler = ForwardLabelSampler(label_table)
-    
+    max_classes = 2
+
     train_datasets = []
-    # [CRITICAL FIX] Initialize val_datasets
     val_datasets = []
     
-    backward_sampler = BackwardSubgraphSampler(samp_conf)
-    context_sampler = ContextSampler(samp_conf, backward_sampler)
+    backward_sampler = BackwardSubgraphSampler(sampling_config)
+    context_sampler = ContextSampler(sampling_config, backward_sampler)
     context_sampler.attach_label_table(label_table)
-    
-    for ds_name in target_ds:
+
+    for i, ds_name in enumerate(target_ds):
         try:
-            if rank == 0: print(f"Loading {ds_name}...")
+            if rank == 0: print(f"\n[Rank {rank}] Loading dataset {i+1}: {ds_name}...", flush=True)
             adapter = RelBenchAdapter(ds_name)
             ds = adapter.load_dataset()
-            
             raw_g = adapter.build_temporal_graph()
-            # [CRITICAL FIX] Avoid variable scoping error by directly using the function result
-            pref_g, pref_s = apply_dataset_prefix(raw_g, get_database_schema_from_relbench(ds), ds_name)
-            
+            raw_s = get_database_schema_from_relbench(ds)
+            pref_g, pref_s = apply_dataset_prefix(raw_g, raw_s, ds_name)
             make_graph_shared(pref_g)
+            
             str_graph_map[ds_name] = pref_g
             combined_schema.update(pref_s)
             
-            task_list = [args.task] if args.task not in ['ALL', 'auto'] else list(ds.tasks.keys())
-            if args.task == 'auto' and task_list: task_list = task_list[:1]
+            for nt in pref_g.node_types: get_registry_id(NODE_TYPE_REGISTRY, nt)
+            get_registry_id(DATASET_NAME_REGISTRY, ds_name)
             
-            for t_name in task_list:
+            tasks = [args.task] if args.task != 'ALL' and args.task != 'auto' else list(ds.tasks.keys())
+            if not tasks and args.task=='auto': tasks = list(ds.tasks.keys())[:1]
+            
+            for t_name in tasks:
                 conf = adapter.get_task_config(t_name)
                 splits = adapter.get_train_test_split(t_name)
+                if conf.num_classes and conf.num_classes > max_classes: max_classes = conf.num_classes
+                
+                get_registry_id(TASK_CONFIG_REGISTRY, conf)
                 
                 def fix_ent(split):
                     split['entities'] = [(f"{ds_name}__{e}", i) for e, i in split['entities']]
+                    if split.get('dst_entities'):
+                        split['dst_entities'] = [(f"{ds_name}__{e}", i) for e, i in split['dst_entities']]
                     return split
                 
                 fwd_sampler.ingest_relbench_split(fix_ent(splits['train']))
+                if 'val' in splits: fwd_sampler.ingest_relbench_split(fix_ent(splits['val']))
+                
                 train_datasets.append(RelBenchDataset(
-                    splits['train']['entities'], splits['train']['labels'], splits['train']['timestamps'],
+                    splits['train']['entities'], splits['train']['labels'], splits['train']['timestamps'], 
                     conf, ds_name, pref_g, backward_sampler, context_sampler, NODE_TYPE_REGISTRY,
-                    num_context=args.num_context, max_neighbors=args.max_neighbors
+                    dst_entities=splits['train'].get('dst_entities'), 
+                    num_context=args.num_context
                 ))
+
                 if 'val' in splits:
                     val_datasets.append(RelBenchDataset(
                         splits['val']['entities'], splits['val']['labels'], splits['val']['timestamps'], 
                         conf, ds_name, pref_g, backward_sampler, context_sampler, NODE_TYPE_REGISTRY,
-                        num_context=args.num_context, max_neighbors=args.max_neighbors
+                        dst_entities=splits['val'].get('dst_entities'),
+                        num_context=args.num_context
                     ))
             
-            # [CRITICAL FIX] Correct cleanup
-            del adapter, ds, raw_g
+            del adapter, ds, raw_g, raw_s
             gc.collect()
         except Exception as e:
-            if rank == 0: logger.error(f"Failed {ds_name}: {e}")
+            if rank == 0: logger.error(f"Error loading {ds_name}: {e}")
 
     label_table.finalize()
-    if not train_datasets:
-        if rank == 0: logger.error("No datasets!")
-        ddp_cleanup(world_size); return
+    
+    full_train_ds = ConcatDataset(train_datasets)
+    full_val_ds = ConcatDataset(val_datasets) if val_datasets else None
+    
+    train_sampler = DistributedSampler(full_train_ds, num_replicas=world_size, rank=rank)
+    val_sampler = DistributedSampler(full_val_ds, num_replicas=world_size, rank=rank) if full_val_ds else None
+    
+    exp_config = ExperimentConfig(
+        num_epochs=args.epochs, early_stopping_patience=args.early_stopping_patience,
+        save_dir=args.output_dir, log_dir=str(Path(args.output_dir) / "logs")
+    )
 
-    full_train = ConcatDataset(train_datasets)
-    if world_size > 1: sampler = DistributedSampler(full_train, num_replicas=world_size, rank=rank)
-    else: sampler = RandomSampler(full_train)
+    if args.num_workers is not None: exp_config.num_workers = args.num_workers
+    if args.prefetch_factor is not None: exp_config.prefetch_factor = args.prefetch_factor
+    final_workers = exp_config.num_workers if exp_config.num_workers else 4
     
-    loader = DataLoader(full_train, batch_size=args.batch_size, sampler=sampler,
-                        collate_fn=collate_fn, num_workers=0, pin_memory=(device.type=='cuda'))
+    use_pin_memory = not args.disable_pin_memory
+
+    train_loader = DataLoader(
+        full_train_ds, batch_size=args.batch_size, shuffle=False, sampler=train_sampler,
+        collate_fn=collate_fn, num_workers=final_workers, pin_memory=use_pin_memory
+    )
+
+    val_loader = DataLoader(
+        full_val_ds, batch_size=args.batch_size, shuffle=False, sampler=val_sampler,
+        collate_fn=collate_fn, num_workers=final_workers, pin_memory=use_pin_memory
+    ) if full_val_ds else None
     
-    if val_datasets:
-        full_val = ConcatDataset(val_datasets)
-        if world_size > 1: val_sampler = DistributedSampler(full_val, num_replicas=world_size, rank=rank)
-        else: val_sampler = SequentialSampler(full_val)
-        val_loader = DataLoader(full_val, batch_size=args.batch_size, sampler=val_sampler,
-                                collate_fn=collate_fn, num_workers=0, pin_memory=(device.type=='cuda'))
-    else:
-        val_loader = None
+    conf = KumoRFMConfig(
+        hidden_dim=args.hidden_dim, num_layers=args.num_layers, num_heads=args.num_heads,
+        dropout_rate=args.dropout, batch_size=args.batch_size, learning_rate=args.lr
+    )
     
-    conf = KumoRFMConfig(hidden_dim=args.hidden_dim, num_layers=args.num_layers, num_heads=args.num_heads, sampling_config=samp_conf)
-    col_stats = compute_heuristic_col_stats(combined_schema)
-    
-    model = KumoRFM(conf, combined_schema, col_stats=col_stats)
-    
+    model = KumoRFM(conf, combined_schema)
     tc_map = {i: c for i, c in enumerate(TASK_CONFIG_REGISTRY)}
-    ds_map = {n: i for i, n in enumerate(DATASET_NAME_REGISTRY)}
+    ds_name_map = {n: i for i, n in enumerate(DATASET_NAME_REGISTRY)}
     nt_map = {n: i for i, n in enumerate(NODE_TYPE_REGISTRY)}
-    model.set_global_resources(str_graph_map, ds_map, nt_map, tc_map)
-    model.set_task_config(TaskConfig('classification', num_classes=2))
     
+    model.set_global_resources(str_graph_map, ds_name_map, nt_map, tc_map)
+    model.set_task_config(TaskConfig('classification', num_classes=max_classes))
     model.backward_sampler = backward_sampler
     model.context_sampler = context_sampler
     
     model = model.to(device)
-    if world_size > 1 and device.type == 'cuda':
-        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+    model = DDP(model, device_ids=[rank], find_unused_parameters=True)
     
-    trainer = RelBenchTrainer(model, conf, ExperimentConfig(save_dir=args.output_dir), device, rank, is_distributed=(world_size > 1))
-    trainer.train(loader, val_loader)
+    trainer = RelBenchTrainer(model, conf, exp_config, device, rank)
+    trainer.train(train_loader, val_loader)
     
-    ddp_cleanup(world_size)
+    ddp_cleanup()
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', default='trial')
-    parser.add_argument('--task', default='auto')
+    parser.add_argument('--dataset', type=str, default='trial')
+    parser.add_argument('--task', type=str, default='auto')
     parser.add_argument('--hidden-dim', type=int, default=256)
     parser.add_argument('--num-layers', type=int, default=4)
     parser.add_argument('--num-heads', type=int, default=8)
@@ -445,22 +490,20 @@ def main():
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--early-stopping-patience', type=int, default=10)
-    parser.add_argument('--output-dir', default='./relbench_outputs')
-    
+    parser.add_argument('--output-dir', type=str, default='./relbench_outputs')
+    parser.add_argument('--num-workers', type=int, default=None)
+    parser.add_argument('--prefetch-factor', type=int, default=None)
     parser.add_argument('--max-neighbors', type=int, default=10)
     parser.add_argument('--num-context', type=int, default=5)
     parser.add_argument('--num-hops', type=int, default=2)
     parser.add_argument('--nprocs', type=int, default=None)
+    parser.add_argument('--disable-pin-memory', action='store_true', help="Disable pin_memory to save RAM")
     
     args, _ = parser.parse_known_args()
+    world_size = args.nprocs if args.nprocs else (torch.cuda.device_count() if torch.cuda.is_available() else 1)
     
-    ws = args.nprocs if args.nprocs else 1
-    if not torch.cuda.is_available(): ws = 1
-    elif ws > torch.cuda.device_count(): ws = torch.cuda.device_count()
-    
-    print(f"Spawning {ws} processes...")
-    if ws > 1: mp.spawn(main_worker, args=(ws, args), nprocs=ws)
-    else: main_worker(0, 1, args)
+    print(f"Spawning {world_size} processes for DDP training...", flush=True)
+    mp.spawn(main_worker, args=(world_size, args), nprocs=world_size)
 
 if __name__ == '__main__':
     main()
