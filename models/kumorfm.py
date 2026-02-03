@@ -1,10 +1,10 @@
 """
-KumoRFM Main Model - Raw Feature Probe Mode
-(Checking Feature Sim BEFORE Positional Encoding)
+KumoRFM Main Model - Fixed Method Indentation
+Ensures helper methods are part of the class to fix AttributeError.
 """
 import torch
 import torch.nn as nn
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 import math
 import logging
@@ -14,51 +14,26 @@ from config.model_config import KumoRFMConfig, TaskConfig
 from data.temporal_graph import TemporalHeterogeneousGraph
 from .encoders.multimodal_encoder import MultiModalEncoder
 from .encoders.table_encoder import MultiTableEncoder
-from .encoders.positional_encoding import MultiElementTokenizer
 from .relgt.relgt_model import RelGTWrapper
 from .icl.icl_module import ICLModule, ClassificationHead, RegressionHead, LinkPredictionHead
-from .icl.dual_context import DualContextMechanism
+from utils.debug_probe import DebugProbe
 
 logger = logging.getLogger(__name__)
-
-# --- DEBUG UTILS ---
-def debug_tensor_stats(name, tensor):
-    if tensor.numel() == 0: return f"{name}: EMPTY"
-    return f"{name}: Shape={list(tensor.shape)} | Mean={tensor.mean().item():.4f} | Std={tensor.std().item():.4f}"
-
-def check_feature_diversity(name, embs):
-    # Check pairwise similarity within batch
-    if embs.shape[0] < 2: return f"{name}: Not enough samples"
-    
-    norm = F.normalize(embs, p=2, dim=1)
-    sim = torch.mm(norm, norm.t())
-    mask = torch.eye(sim.size(0), device=sim.device).bool()
-    avg_sim = sim[~mask].mean().item()
-    
-    log = f"  [{name} DIVERSITY]\n"
-    log += f"  -> Avg CosSim: {avg_sim:.4f} (Should be < 0.5)\n"
-    if avg_sim > 0.8: log += "  -> [WARNING] Features are extremely SIMILAR!\n"
-    return log
-
-# -------------------
 
 class NeighborNodeTypeEncoder(nn.Module):
     def __init__(self, node_type_map, embedding_dim):
         super().__init__()
-        num_types = (max(node_type_map.values()) + 1) if node_type_map else 5000
-        safe_num = max(num_types, 5000)
-        self.embedding = nn.Embedding(safe_num, embedding_dim)
+        num_types = (max(node_type_map.values()) + 2) if node_type_map else 5002
+        self.embedding = nn.Embedding(num_types, embedding_dim)
         nn.init.orthogonal_(self.embedding.weight)
-    def forward(self, x):
-        return self.embedding(x.clamp(max=self.embedding.num_embeddings-1))
+    def forward(self, x): return self.embedding(x.clamp(max=self.embedding.num_embeddings-1))
 
 class NeighborHopEncoder(nn.Module):
     def __init__(self, max_hop, dim):
         super().__init__()
         self.embedding = nn.Embedding(max_hop + 10, dim)
-        nn.init.orthogonal_(self.embedding.weight)
-    def forward(self, x): 
-        return self.embedding((x+1).clamp(0, self.embedding.num_embeddings-1))
+        nn.init.xavier_uniform_(self.embedding.weight)
+    def forward(self, x): return self.embedding((x+1).clamp(0, self.embedding.num_embeddings-1))
 
 class NeighborTimeEncoder(nn.Module):
     def __init__(self, dim):
@@ -66,8 +41,6 @@ class NeighborTimeEncoder(nn.Module):
         self.dim = dim
         self.project = nn.Linear(dim, dim)
         nn.init.normal_(self.project.weight, std=0.01)
-        nn.init.zeros_(self.project.bias)
-
     def forward(self, rel_time):
         device = rel_time.device
         if rel_time.dim() == 1: rel_time = rel_time.unsqueeze(0).unsqueeze(-1)
@@ -80,6 +53,19 @@ class NeighborTimeEncoder(nn.Module):
         sinus[..., 1::2] = torch.cos(pos * div[:self.dim//2])
         return self.project(sinus)
 
+class StructureEncoder(nn.Module):
+    def __init__(self, dim, max_degree=128):
+        super().__init__()
+        self.degree_embedding = nn.Embedding(max_degree + 1, dim)
+        nn.init.xavier_uniform_(self.degree_embedding.weight)
+    def forward(self, edge_index, num_nodes, device):
+        if edge_index.numel() == 0: deg = torch.zeros(num_nodes, dtype=torch.long, device=device)
+        else:
+            row, col = edge_index
+            deg = torch.bincount(row, minlength=num_nodes) + torch.bincount(col, minlength=num_nodes)
+        deg = deg.clamp(max=self.degree_embedding.num_embeddings - 1)
+        return self.degree_embedding(deg)
+
 class KumoRFM(nn.Module):
     def __init__(self, config: KumoRFMConfig, database_schema: Dict):
         super().__init__()
@@ -87,27 +73,21 @@ class KumoRFM(nn.Module):
         self.database_schema = database_schema
         self.graph_map = {}
         self.task_config_map = {}
-        self.id_to_node_type = {}
         self.node_type_to_id = {}
         
-        self.backward_sampler = None
-        self.context_sampler = None
-        self.has_printed_debug = False
-
         self._init_encoders()
+        
         self.relgt = RelGTWrapper(config, len(database_schema)+5000)
         self.icl_module = ICLModule(config)
-        self.dual_context = DualContextMechanism(config)
         self._register_heads()
         
+        self.feature_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
         self.feature_norm = nn.LayerNorm(config.hidden_dim)
-        
+        self.final_emb_norm = nn.LayerNorm(config.hidden_dim)
         self.global_max_dim = 2 
 
     def set_global_resources(self, graph_map, ds_map, nt_map, tc_map):
         self.graph_map = {ds_map[k]: v for k, v in graph_map.items()}
-        self.id_to_dataset_name = {v: k for k, v in ds_map.items()}
-        self.id_to_node_type = {v: k for k, v in nt_map.items()}
         self.node_type_to_id = nt_map
         self.relgt_type_encoder = NeighborNodeTypeEncoder(nt_map, self.config.hidden_dim)
         self.task_config_map = tc_map
@@ -118,11 +98,11 @@ class KumoRFM(nn.Module):
         for t, cols in self.database_schema.items():
             for c, ctype in cols.items(): self.multimodal_encoder.register_column(f"{t}.{c}", ctype)
         self.table_encoder = MultiTableEncoder(self.config, list(self.database_schema.keys()))
-        self.tokenizer = MultiElementTokenizer(self.config, len(self.database_schema))
         dim = self.config.hidden_dim
         self.relgt_type_encoder = NeighborNodeTypeEncoder({}, dim)
         self.relgt_hop_encoder = NeighborHopEncoder(5, dim)
         self.relgt_time_encoder = NeighborTimeEncoder(dim)
+        self.relgt_struct_encoder = StructureEncoder(dim)
 
     def _register_heads(self):
         self.icl_module.register_task_head('classification', ClassificationHead(self.config, 2))
@@ -133,161 +113,88 @@ class KumoRFM(nn.Module):
         if config.task_type == 'classification' and config.num_classes:
             self.icl_module.register_task_head('classification', ClassificationHead(self.config, config.num_classes))
         self.global_max_dim = self._get_global_max_dim()
-
-    def _get_global_max_dim(self):
-        max_d = 1
-        for name, head in self.icl_module.task_heads.items():
-            if isinstance(head, ClassificationHead):
-                try: max_d = max(max_d, head.projection[-1].out_features)
-                except: max_d = max(max_d, 2)
-            elif isinstance(head, RegressionHead):
-                max_d = max(max_d, 1)
-        return max(max_d, 2)
+    
+    def _get_global_max_dim(self): return 2
 
     def forward(self, dataset_ids, entity_type_ids, entity_ids, timestamps, task_config_ids, 
                 test_subgraphs=None, target_ents=None, ctx_exs_list=None,
                 test_dst_subgraphs=None, target_dst_ents=None):
+        
         device = dataset_ids.device
         batch_size = len(dataset_ids)
 
-        all_ctx_subgraphs = []
-        all_ctx_targets_ent = []
-        
-        batch_target_types, batch_target_ids = [], []
-        batch_ctx_types, batch_ctx_ids = [], []
-        batch_ctx_timestamps, batch_ctx_labels = [], []
-        task_types = []
+        all_ctx_subgraphs, all_ctx_targets_ent, all_ctx_labels, all_ctx_task_types = [], [], [], []
+        batch_split_indices = [0]
+        curr_count = 0
 
         for i in range(batch_size):
-            nt_id = entity_type_ids[i].item()
-            node_id = entity_ids[i].item()
-            
+            ctx_exs = ctx_exs_list[i]
             task_idx = task_config_ids[i].item()
             task_conf = self.task_config_map.get(task_idx, list(self.task_config_map.values())[0])
-            
-            task_types.append(task_conf.task_type)
-            batch_target_types.append(nt_id)
-            batch_target_ids.append(node_id)
-            
-            ctx_exs = ctx_exs_list[i]
-            c_types, c_ids, c_ts, c_lbls = [], [], [], []
             for ctx in ctx_exs:
                 all_ctx_subgraphs.append(ctx.subgraph)
                 all_ctx_targets_ent.append(ctx.entity)
-                
-                c_nt_name, c_nid = ctx.entity
-                c_types.append(self.node_type_to_id.get(c_nt_name, 0))
-                c_ids.append(c_nid)
-                c_ts.append(ctx.timestamp.timestamp())
-                c_lbls.append(ctx.label)
-            
-            batch_ctx_types.append(c_types)
-            batch_ctx_ids.append(c_ids)
-            batch_ctx_timestamps.append(c_ts)
-            batch_ctx_labels.append(c_lbls)
+                all_ctx_labels.append(ctx.label)
+                all_ctx_task_types.append(task_conf.task_type)
+            curr_count += len(ctx_exs)
+            batch_split_indices.append(curr_count)
 
-        # 2. Batched Encoding
-        test_embs = self._batch_encode_subgraphs(test_subgraphs, target_ents, timestamps, device)
-
-        if test_dst_subgraphs and any(t == 'link_prediction' for t in task_types):
-             dst_embs = self._batch_encode_subgraphs(test_dst_subgraphs, target_dst_ents, timestamps, device)
-             test_embs = (test_embs + dst_embs) / 2.0
-        
+        ctx_flat_embs = torch.zeros(0, self.config.hidden_dim, device=device)
         if all_ctx_subgraphs:
-            ctx_flat_embs = self._batch_encode_subgraphs(all_ctx_subgraphs, all_ctx_targets_ent, None, device)
-            if batch_size > 0:
-                real_num_ctx = len(all_ctx_subgraphs) // batch_size
-                ctx_embs = ctx_flat_embs.view(batch_size, real_num_ctx, -1)
-            else:
-                ctx_embs = torch.zeros(0, 0, self.config.hidden_dim, device=device)
-        else:
-            ctx_embs = torch.zeros(batch_size, 0, self.config.hidden_dim, device=device)
-
-        # --- [DIAGNOSTIC LOGIC] ---
-        if not self.has_printed_debug and ctx_embs.size(1) > 0:
-            print("\n" + "="*60)
-            print(" [DIAGNOSTIC] Final Logic Analysis")
-            print("="*60)
-            # Check final embedding diversity
-            print(check_feature_diversity("Final Test Emb", test_embs))
-            
-            self.has_printed_debug = True
-        # ------------------------------
-
-        # 3. Vectorized ICL & Dual Context
-        t_types = torch.tensor(batch_target_types, device=device).view(batch_size, 1)
-        t_ids = torch.tensor(batch_target_ids, device=device).view(batch_size, 1)
-        c_types = torch.tensor(batch_ctx_types, device=device)
-        c_ids = torch.tensor(batch_ctx_ids, device=device)
-        c_ts = torch.tensor(batch_ctx_timestamps, device=device)
-        t_ts = timestamps.view(batch_size, 1)
-
-        intra_mask = ((t_types == c_types) & (t_ids == c_ids)).float()
-
-        if len(set(task_types)) == 1:
-            task_type = task_types[0]
-            label_tensor = self._batch_process_labels(batch_ctx_labels, task_type).to(device)
-            enhanced_test, _ = self.dual_context(
-                ctx_embs, label_tensor.unsqueeze(-1), test_embs.unsqueeze(1),
-                c_ts, t_ts, intra_mask
+            ctx_flat_embs = self._batch_encode_subgraphs(
+                all_ctx_subgraphs, all_ctx_targets_ent, None, device, 
+                inject_labels=all_ctx_labels, task_types=all_ctx_task_types, tag="CTX"
             )
-            final_preds = self._run_icl_vectorized(ctx_embs, label_tensor, enhanced_test.squeeze(1), task_type)
-        else:
-            final_preds_list = []
-            for i in range(batch_size):
-                t_e = test_embs[i].unsqueeze(0).unsqueeze(1)
-                c_e = ctx_embs[i].unsqueeze(0)
-                l_raw = batch_ctx_labels[i]
-                l_ts = self._process_labels(l_raw, self.task_config_map.get(task_config_ids[i].item())).to(device)
-                curr_intra = intra_mask[i].unsqueeze(0)
-                enh, _ = self.dual_context(c_e, l_ts, t_e, c_ts[i].unsqueeze(0), t_ts[i].unsqueeze(0), curr_intra)
-                
-                task_conf = self.task_config_map.get(task_config_ids[i].item())
-                c_list = [c_e[0, k] for k in range(len(l_raw))]
-                pred = self.icl_module(c_list, l_raw, enh.squeeze(0).squeeze(0), task_conf.task_type)
-                if pred.dim() == 0: pred = pred.view(1) 
-                if pred.dim() == 1: pred = pred.view(1, -1)
-                final_preds_list.append(pred)
+
+        test_embs = self._batch_encode_subgraphs(
+            test_subgraphs, target_ents, timestamps, device, tag="TEST"
+        )
+        if test_dst_subgraphs:
+             dst_embs = self._batch_encode_subgraphs(test_dst_subgraphs, target_dst_ents, timestamps, device, tag="DST")
+             test_embs = (test_embs + dst_embs) / 2.0
+
+        final_preds_list = []
+        for i in range(batch_size):
+            start, end = batch_split_indices[i], batch_split_indices[i+1]
+            if start < end:
+                c_seq = ctx_flat_embs[start:end] 
+                c_lbls = all_ctx_labels[start:end]
+            else:
+                c_seq = torch.zeros(0, self.config.hidden_dim, device=device)
+                c_lbls = []
             
-            final_preds = torch.cat(self._smart_pad(final_preds_list, task_types, device), dim=0)
+            t_seq = test_embs[i].unsqueeze(0)
+            task_idx = task_config_ids[i].item()
+            task_conf = self.task_config_map.get(task_idx)
+            
+            c_list = torch.unbind(c_seq, dim=0) 
+            pred = self.icl_module(c_list, c_lbls, t_seq.squeeze(0), task_conf.task_type)
+            if pred.dim() == 0: pred = pred.view(1) 
+            if pred.dim() == 1: pred = pred.view(1, -1)
+            final_preds_list.append(pred)
 
-        final_preds = self._smart_pad_tensor(final_preds, self.global_max_dim)
-
+        batch_task_types = [self.task_config_map.get(tid.item()).task_type for tid in task_config_ids]
+        final_preds = torch.cat(self._smart_pad(final_preds_list, batch_task_types, device), dim=0)
+        DebugProbe.check_tensor("Final_Preds", final_preds)
         return {'predictions': final_preds}
 
-    def _smart_pad_tensor(self, tensor, target_dim):
-        current_dim = tensor.shape[-1]
-        if current_dim < target_dim:
-            pad_size = target_dim - current_dim
-            pad = torch.zeros((tensor.shape[0], pad_size), device=tensor.device)
-            return torch.cat([tensor, pad], dim=-1)
-        return tensor
-
-    def _batch_encode_subgraphs(self, subgraphs, target_entities, timestamps, device):
+    def _batch_encode_subgraphs(self, subgraphs, target_entities, timestamps, device, 
+                              inject_labels: Optional[List[Any]] = None,
+                              task_types: Optional[List[str]] = None, tag=""):
         if not subgraphs: return torch.zeros(0, self.config.hidden_dim, device=device)
 
         batch_node_features = {}
-        batch_node_counts = {}
-        
         for sub in subgraphs:
             for nt in sub.node_types:
-                if nt not in batch_node_features:
-                    batch_node_features[nt] = []
-                    batch_node_counts[nt] = []
-                
+                if nt not in batch_node_features: batch_node_features[nt] = []
                 f = sub.node_features.get(nt)
-                if f is None:
-                    f = torch.zeros(sub.node_counts[nt], self.config.hidden_dim)
-                
+                if f is None: f = torch.zeros(sub.node_counts[nt], self.config.hidden_dim)
                 if f.dim() == 1: f = f.unsqueeze(-1)
                 if f.shape[-1] < self.config.hidden_dim:
                     pad = torch.zeros(f.shape[0], self.config.hidden_dim - f.shape[-1])
                     f = torch.cat([f, pad], dim=-1)
-                elif f.shape[-1] > self.config.hidden_dim:
-                    f = f[:, :self.config.hidden_dim]
-                    
+                elif f.shape[-1] > self.config.hidden_dim: f = f[:, :self.config.hidden_dim]
                 batch_node_features[nt].append(f)
-                batch_node_counts[nt].append(sub.node_counts[nt])
 
         big_input = {}
         for nt, feats in batch_node_features.items():
@@ -296,15 +203,16 @@ class KumoRFM(nn.Module):
                 big_input[nt] = cat_f.unsqueeze(0).unsqueeze(2) if cat_f.dim()==2 else cat_f
         
         big_enc = self.table_encoder(big_input)
-
         nt_offsets = {nt: 0 for nt in big_enc.keys()}
-        giant_tokens, giant_nt, giant_ei, giant_et, tgt_indices, curr_off = [], [], [], [], [], 0
         
-        raw_feat_probe = [] # To store raw features before summing PE
+        giant_tokens, giant_nt, giant_ei, giant_et = [], [], [], []
+        giant_batch_idx = [] 
+        tgt_indices, curr_off = [], 0
+        VIRTUAL_LABEL_TYPE_ID = len(self.node_type_to_id) + 1 
+        VIRTUAL_EDGE_TYPE_ID = 999 
 
         for i, sub in enumerate(subgraphs):
             g_f, g_t, g_map, g_c = [], [], {}, 0
-            
             for nt in sub.node_types:
                 cnt = sub.node_counts[nt]
                 if nt in big_enc:
@@ -312,123 +220,110 @@ class KumoRFM(nn.Module):
                     end = start + cnt
                     g_f.append(big_enc[nt].squeeze(0)[start:end])
                     nt_offsets[nt] = end
-                else:
-                     g_f.append(torch.zeros(cnt, self.config.hidden_dim, device=device))
-
+                else: g_f.append(torch.zeros(cnt, self.config.hidden_dim, device=device))
                 g_t.extend([self.node_type_to_id.get(nt,0)]*cnt)
                 g_map[nt] = (g_c, g_c+cnt)
                 g_c += cnt
             
-            if not g_f: 
-                tgt_indices.append(curr_off)
-                giant_tokens.append(torch.zeros(1,self.config.hidden_dim,device=device))
-                giant_nt.append(torch.tensor([0],device=device))
-                curr_off+=1; continue
-            
-            tokens = torch.cat(g_f, dim=0)
+            tokens = torch.cat(g_f, dim=0) if g_f else torch.zeros(0, self.config.hidden_dim, device=device)
             nt_tsr = torch.tensor(g_t, device=device)
             
-            # --- [PROBE] Check Raw Feature Diversity (First graph only) ---
-            if i == 0 and not self.has_printed_debug:
-                raw_feat_probe = tokens
-                print("\n  [DIAGNOSTIC] Feature Before RelGT & PE")
-                print(check_feature_diversity("Raw Tokens (Graph 0)", raw_feat_probe))
-            # --------------------------------------------------------
-
             edges, ets = [], []
             for idx, et in enumerate(sub.edge_types):
                 if et in sub.edge_indices:
-                    e = sub.edge_indices[et].clone() 
+                    e = sub.edge_indices[et].to(device).clone()
                     e[0] += g_map[et[0]][0]
                     e[1] += g_map[et[2]][0]
-                    
                     edges.append(e)
                     ets.extend([idx]*e.shape[1])
-                    
                     e_rev = torch.stack([e[1], e[0]], dim=0)
                     edges.append(e_rev)
                     ets.extend([idx]*e.shape[1])
             
-            if edges:
-                ei = torch.cat(edges, dim=1).to(device)
-                et_tsr = torch.tensor(ets, dtype=torch.long, device=device)
-            else:
-                ei = torch.zeros((2,0), dtype=torch.long, device=device)
-                et_tsr = torch.zeros(0, dtype=torch.long, device=device)
+            if inject_labels is not None:
+                label_val = inject_labels[i]
+                val_scalar = label_val.item() if hasattr(label_val, 'item') else label_val
+                l_tsr = torch.tensor([[val_scalar]], device=device)
+                l_emb_3d = self.icl_module.label_encoder(l_tsr, task_types[i], device=device) 
+                l_emb = l_emb_3d.reshape(1, self.config.hidden_dim)
+                
+                if i == 0: DebugProbe.check_tensor(f"{tag}_Label_Emb", l_emb)
+
+                tokens = torch.cat([tokens, l_emb], dim=0)
+                nt_tsr = torch.cat([nt_tsr, torch.tensor([VIRTUAL_LABEL_TYPE_ID], device=device)], dim=0)
+                t_type, _ = target_entities[i]
+                t_local_id = getattr(sub, 'target_local_index', 0)
+                if t_type in g_map:
+                    t_idx_in_graph = g_map[t_type][0] + t_local_id
+                    label_node_idx = tokens.shape[0] - 1
+                    new_edge = torch.tensor([[t_idx_in_graph, label_node_idx], [label_node_idx, t_idx_in_graph]], device=device)
+                    edges.append(new_edge)
+                    ets.extend([VIRTUAL_EDGE_TYPE_ID, VIRTUAL_EDGE_TYPE_ID])
             
+            ei = torch.cat(edges, dim=1).to(device) if edges else torch.zeros((2,0), dtype=torch.long, device=device)
+            et_tsr = torch.tensor(ets, dtype=torch.long, device=device) if edges else torch.zeros(0, dtype=torch.long, device=device)
+
             ts_val = timestamps[i] if timestamps is not None else datetime.now(timezone.utc)
             if isinstance(ts_val, torch.Tensor): ts_val = datetime.fromtimestamp(ts_val.item(), tz=timezone.utc)
+            time = self._get_time_differences(sub, ts_val, g_map, scale_to_days=True).to(device)
+            if tokens.shape[0] > time.shape[0]:
+                pad_t = torch.zeros(tokens.shape[0] - time.shape[0], device=device)
+                time = torch.cat([time, pad_t], dim=0)
 
             hop = self._get_hop_distances(sub, target_entities[i], g_map).to(device)
-            time = self._get_time_differences(sub, ts_val, g_map, scale_to_days=True).to(device)
-            
+            if tokens.shape[0] > hop.shape[0]:
+                pad_h = torch.zeros(tokens.shape[0] - hop.shape[0], dtype=torch.long, device=device)
+                hop = torch.cat([hop, pad_h], dim=0)
+
             tokens = self.feature_norm(tokens)
-            
+            tokens_proj = self.feature_proj(tokens)
             t_emb = self.relgt_type_encoder(nt_tsr)
             h_emb = self.relgt_hop_encoder(hop)
             tm_emb = self.relgt_time_encoder(time.unsqueeze(0).float()).squeeze(0)
-            
-            tokens = tokens + t_emb + h_emb + tm_emb
+            s_emb = self.relgt_struct_encoder(ei, tokens.shape[0], device)
+
+            if i == 0: 
+                DebugProbe.check_tensor(f"{tag}_Comp_Content", tokens_proj)
+                DebugProbe.check_tensor(f"{tag}_Comp_Type", t_emb)
+                DebugProbe.check_tensor(f"{tag}_Comp_Hop", h_emb)
+                DebugProbe.check_tensor(f"{tag}_Comp_Time", tm_emb)
+                DebugProbe.check_tensor(f"{tag}_Comp_Struct", s_emb)
+
+            tokens = tokens_proj + t_emb + h_emb + tm_emb + s_emb
+            tokens = self.final_emb_norm(tokens)
             
             t_type, _ = target_entities[i]
-            t_local_id = getattr(sub, 'target_local_index', 0) 
-            
-            if t_type in g_map:
-                loc = g_map[t_type][0] + t_local_id 
-                if 0 <= loc < len(tokens):
-                    perm = torch.cat([
-                        torch.tensor([loc], device=device), 
-                        torch.arange(0, loc, device=device), 
-                        torch.arange(loc+1, len(tokens), device=device)
-                    ])
-                    tokens = tokens[perm]
-                    nt_tsr = nt_tsr[perm]
-                    inv = torch.zeros_like(perm)
-                    inv[perm] = torch.arange(len(perm), device=device)
-                    ei = inv[ei]
+            t_local_id = getattr(sub, 'target_local_index', 0)
+            readout_idx = 0
+            if t_type in g_map: readout_idx = g_map[t_type][0] + t_local_id
             
             giant_tokens.append(tokens)
             giant_nt.append(nt_tsr)
             giant_ei.append(ei + curr_off)
             giant_et.append(et_tsr)
-            
-            tgt_indices.append(curr_off)
+            giant_batch_idx.append(torch.full((tokens.shape[0],), i, dtype=torch.long, device=device))
+            tgt_indices.append(curr_off + readout_idx)
             curr_off += len(tokens)
-            
-        out_all = self.relgt(
-            torch.cat(giant_tokens, 0), 
+        
+        input_giant = torch.cat(giant_tokens, 0)
+        batch_giant = torch.cat(giant_batch_idx, 0)
+        
+        DebugProbe.check_tensor(f"{tag}_Pre_RelGT", input_giant)
+
+        out_giant = self.relgt(
+            input_giant, 
             torch.cat(giant_ei, 1), 
             torch.cat(giant_nt, 0), 
-            torch.cat(giant_et, 0)
+            torch.cat(giant_et, 0),
+            batch_index=batch_giant
         )
-        return out_all[torch.tensor(tgt_indices, device=device)]
-
-    # ... (rest of methods)
-    def _run_icl_vectorized(self, ctx_embs, ctx_labels, test_emb, task_type):
-        label_emb = self.icl_module.label_encoder(ctx_labels, task_type, device=ctx_embs.device)
-        full_ctx = ctx_embs + label_emb
-        full_test = test_emb.unsqueeze(1)
-        B = ctx_embs.size(0)
-        query = self.icl_module.query_token.expand(B, -1, -1)
-        seq = torch.cat([full_ctx, full_test, query], dim=1)
-        seq_len = seq.size(1)
-        if seq_len > self.icl_module.position_encoding.size(1):
-             seq = seq[:, -self.icl_module.position_encoding.size(1):, :]
-             seq_len = seq.size(1)
-        seq = seq + self.icl_module.position_encoding[:, :seq_len, :]
-        for layer in self.icl_module.icl_layers:
-            seq = layer(seq)
-        q_out = seq[:, -1, :]
         
-        pred = q_out
-        if task_type in self.icl_module.task_heads:
-            pred = self.icl_module.task_heads[task_type](q_out)
+        final_embs = out_giant[torch.tensor(tgt_indices, device=device)]
+        DebugProbe.check_tensor(f"{tag}_Post_RelGT", final_embs)
         
-        if pred.dim() == 1:
-            pred = pred.view(-1, 1)
-            
-        return pred
+        return final_embs
 
+    # --- Helpers ---
     def _smart_pad(self, preds_list, task_types, device):
         max_dim = max(p.shape[-1] for p in preds_list)
         out = []
@@ -440,10 +335,13 @@ class KumoRFM(nn.Module):
             out.append(p)
         return out
 
-    def _batch_process_labels(self, labels_list, task_type):
-        flat = [item for sublist in labels_list for item in sublist]
-        dtype = torch.long if task_type == 'classification' else torch.float
-        return torch.tensor(flat, dtype=dtype).view(len(labels_list), len(labels_list[0]))
+    def _smart_pad_tensor(self, tensor, target_dim):
+        current_dim = tensor.shape[-1]
+        if current_dim < target_dim:
+            pad_size = target_dim - current_dim
+            pad = torch.zeros((tensor.shape[0], pad_size), device=tensor.device)
+            return torch.cat([tensor, pad], dim=-1)
+        return tensor
 
     def _get_hop_distances(self, subgraph, target, mapping):
         hops = torch.full((sum(subgraph.node_counts.values()),), 3, dtype=torch.long)
@@ -462,15 +360,6 @@ class KumoRFM(nn.Module):
                 t = subgraph.node_timestamps[nt]
                 s, e = mapping[nt]
                 delta = base - t
-                if scale_to_days:
-                    delta = (delta / 86400.0)
+                if scale_to_days: delta = (delta / 86400.0)
                 diffs[s:e] = delta
         return diffs
-    
-    def _process_labels(self, labels, config):
-        if config.task_type == 'classification':
-            return torch.tensor(self._normalize_labels(labels), dtype=torch.long).unsqueeze(0)
-        return torch.tensor(labels, dtype=torch.float).unsqueeze(0)
-
-    def _normalize_labels(self, labels):
-        return [int(l) if isinstance(l, (int, float)) else 0 for l in labels]

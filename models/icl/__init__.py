@@ -12,11 +12,7 @@ from .icl_module import (
     LinkPredictionHead
 )
 
-from .dual_context import (
-    DualContextMechanism,
-    IntraEntityAttention,
-    RelevanceScorer
-)
+
 
 __all__ = [
     'ICLModule',
@@ -26,7 +22,4 @@ __all__ = [
     'ClassificationHead',
     'RegressionHead',
     'LinkPredictionHead',
-    'DualContextMechanism',
-    'IntraEntityAttention',
-    'RelevanceScorer'
 ]

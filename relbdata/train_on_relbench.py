@@ -1,8 +1,7 @@
-
+# -*- coding: gb18030 -*-
 """
-# -*- coding: utf-8 -*-
-Train KumoRFM on RelBench datasets - DEBUG PROBES
-(Monitoring Gradients, Logits, and Signal-to-Noise Ratio)
+Train KumoRFM on RelBench datasets - DEEP DEBUG MODE
+Integrates DebugProbe for full observability of Gradients, Data, and Features.
 """
 
 import argparse
@@ -50,6 +49,7 @@ from sampling.context_label_table import InContextLabelTable, ForwardLabelSample
 from sampling.backward_sampler import BackwardSubgraphSampler
 from sampling.context_sampler import ContextSampler
 from data.temporal_graph import TemporalHeterogeneousGraph
+from utils.debug_probe import DebugProbe  # [NEW] Import Debug Tool
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +259,10 @@ class RelBenchTrainer:
         
         with context:
             for i, batch in enumerate(tqdm(loader) if self.rank==0 else loader):
+                # Calculate Global Step for DebugProbe
+                global_step = epoch * len(loader) + i
+                DebugProbe.set_step(global_step) # [DEBUG] Update global step
+
                 ds_ids = batch['ds_ids'].to(self.device, non_blocking=True)
                 nt_ids = batch['nt_ids'].to(self.device, non_blocking=True)
                 node_ids = batch['node_ids'].to(self.device, non_blocking=True)
@@ -284,6 +288,9 @@ class RelBenchTrainer:
                 loss = torch.tensor(0.0, device=self.device)
                 valid = 0
                 unique_tasks = torch.unique(task_ids)
+                
+                # [DEBUG] Check batch labels distribution (Are they all 0 or 1?)
+                DebugProbe.check_batch_labels(labels, task_ids)
                 
                 for tid in unique_tasks:
                     mask = (task_ids == tid)
@@ -311,14 +318,17 @@ class RelBenchTrainer:
                     if is_train:
                         loss.backward()
                         
-                        # [PROBE 1] Check Gradient Norm
+                        # [DEBUG] Deep Gradient Check
+                        # This tells us if gradients are vanishing (RelGT depth) or exploding
+                        DebugProbe.check_grad(self.model)
+
+                        # [PROBE] Check basic Gradient Norm for console output
                         grad_norm, has_grad = check_gradients(self.model)
                         if self.rank == 0 and i % 20 == 0:
                             pred_mean = preds.mean().item()
                             pred_std = preds.std().item()
                             label_mean = labels.float().mean().item()
-                            # Replaced special char with standard ASCII
-                            print(f"\n[STEP {i}] Loss: {loss.item():.4f} | GradNorm: {grad_norm:.4f} | Pred: {pred_mean:.2f}+/-{pred_std:.2f} | Label: {label_mean:.2f}")
+                            print(f"\n[STEP {i}] Loss: {loss.item():.4f} | GradNorm: {grad_norm:.4f} | Pred: {pred_mean:.2f}¡À{pred_std:.2f} | Label: {label_mean:.2f}")
                             if not has_grad:
                                 print(" [WARNING] No gradients computed! Check graph disconnects.")
                             if grad_norm > 100:
@@ -354,6 +364,11 @@ def main_worker(rank, world_size, args):
     setup_logger(rank, args.output_dir)
     device = torch.device(f"cuda:{rank}")
     set_random_seed(42 + rank) 
+
+    if rank == 0:
+        print(f"\n[CONFIG] RelGT Impl: {args.relgt_impl}")
+        print(f"[CONFIG] RelGT Layers: {args.num_layers}, ICL Layers: {args.icl_num_layers}")
+        print(f"[CONFIG] Workers: {args.num_workers} (0 = Safe Mode for SIGBUS)")
 
     str_graph_map = {} 
     combined_schema = {}
@@ -441,7 +456,7 @@ def main_worker(rank, world_size, args):
 
     if args.num_workers is not None: exp_config.num_workers = args.num_workers
     if args.prefetch_factor is not None: exp_config.prefetch_factor = args.prefetch_factor
-    final_workers = exp_config.num_workers if exp_config.num_workers else 4
+    final_workers = exp_config.num_workers if exp_config.num_workers is not None else 0 # Default to 0
     
     use_pin_memory = not args.disable_pin_memory
 
@@ -456,9 +471,16 @@ def main_worker(rank, world_size, args):
     ) if full_val_ds else None
     
     conf = KumoRFMConfig(
-        hidden_dim=args.hidden_dim, num_layers=args.num_layers, num_heads=args.num_heads,
-        dropout_rate=args.dropout, batch_size=args.batch_size, learning_rate=args.lr
+        hidden_dim=args.hidden_dim, 
+        num_layers=args.num_layers,
+        icl_num_layers=args.icl_num_layers, # Pass ICL Layers
+        num_heads=args.num_heads,
+        dropout_rate=args.dropout, 
+        batch_size=args.batch_size, 
+        learning_rate=args.lr
     )
+    # [NEW] Inject implementation choice
+    conf.relgt_impl = args.relgt_impl
     
     model = KumoRFM(conf, combined_schema)
     tc_map = {i: c for i, c in enumerate(TASK_CONFIG_REGISTRY)}
@@ -482,16 +504,27 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, default='trial')
     parser.add_argument('--task', type=str, default='auto')
+    
+    # Model Architecture
     parser.add_argument('--hidden-dim', type=int, default=256)
-    parser.add_argument('--num-layers', type=int, default=4)
+    parser.add_argument('--num-layers', type=int, default=4, help="Depth of Graph Transformer (RelGT)")
+    parser.add_argument('--icl-num-layers', type=int, default=2, help="Depth of ICL Transformer")
     parser.add_argument('--num-heads', type=int, default=8)
     parser.add_argument('--dropout', type=float, default=0.3)
+    
+    # [NEW] Graph Transformer Implementation Choice
+    parser.add_argument('--relgt-impl', type=str, default='custom', choices=['pyg', 'custom'],
+                       help="Choose 'pyg' for sparse TransformerConv or 'custom' for dense full-subgraph attention")
+
+    # Training
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--early-stopping-patience', type=int, default=10)
     parser.add_argument('--output-dir', type=str, default='./relbench_outputs')
-    parser.add_argument('--num-workers', type=int, default=None)
+    
+    # System & Data
+    parser.add_argument('--num-workers', type=int, default=0, help="Default 0 to prevent SIGBUS in shared envs")
     parser.add_argument('--prefetch-factor', type=int, default=None)
     parser.add_argument('--max-neighbors', type=int, default=10)
     parser.add_argument('--num-context', type=int, default=5)
